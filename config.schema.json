@@ -1,0 +1,20 @@
+{
+  "pluginAlias": "LennoxS40Platform",
+  "pluginType": "platform",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "host": { "type": "string", "title": "Thermostat IP", "required": true },
+      "clientId": { "type": "string", "title": "Client ID", "default": "homebridge" },
+      "zoneIds": {
+        "type": "array",
+        "title": "Zone IDs",
+        "items": { "type": "integer" },
+        "default": [0]
+      },
+      "verifyTLS": { "type": "boolean", "title": "Verify TLS (self-signed)", "default": false },
+      "longPollSeconds": { "type": "integer", "title": "Long-poll timeout (s)", "default": 15, "minimum": 5, "maximum": 60 },
+      "logBodies": { "type": "boolean", "title": "Debug: log HTTP bodies", "default": false }
+    }
+  }
+}
