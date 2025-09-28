@@ -56,7 +56,7 @@ class CoalescedSetpointWriter {
 
   async flush() {
     this.timer = undefined;
-    if (!this.pending) return;
+       if (!this.pending) return;
 
     // Skip if nothing changed vs the last known device state
     if (this.lastPublished &&
@@ -199,31 +199,47 @@ class LennoxZoneAccessory {
       );
     }
 
-    // >>> NEW: update CurrentHeatingCoolingState from device state <<<
+    // >>> NEW: stable CurrentHeatingCoolingState from op/demand (sticky to avoid flicker)
     {
       const CHCS = this.Characteristic.CurrentHeatingCoolingState;
-      const op = (status.tempOperation || "").toLowerCase(); // "heating" | "cooling" | "off" | etc.
-      const demand = Number.isFinite(status.demand) ? status.demand : 0;
 
-      // Ambient in °F (for fallback comparisons)
-      const ambientF = Number.isFinite(status.temperature)
-        ? status.temperature
-        : (Number.isFinite(status.temperatureC) ? this.cToF(status.temperatureC) : undefined);
+      // Signals from the S40 (seen in your shell output)
+      const rawOp = (status.tempOperation || status.op || "").toString().toLowerCase(); // "cooling" | "heating" | "off"
+      const demand = (typeof status.demand === "number") ? status.demand : undefined;
 
-      let hkState = CHCS.OFF;
+      // Ambient in °F for fallback inference
+      const ambientF = (typeof status.temperature === "number")
+        ? Math.round(status.temperature)
+        : (typeof status.temperatureC === "number" ? Math.round(this.cToF(status.temperatureC)) : undefined);
 
-      if (op === "heating") {
-        hkState = CHCS.HEAT;
-      } else if (op === "cooling") {
-        hkState = CHCS.COOL;
-      } else if (demand > 0 && ambientF !== undefined &&
-                 Number.isFinite(this.currentHspF) && Number.isFinite(this.currentCspF)) {
-        // Fallback: infer from demand + ambient vs setpoints
-        if (ambientF >= this.currentCspF) hkState = CHCS.COOL;
-        else if (ambientF <= this.currentHspF) hkState = CHCS.HEAT;
+      // initialize sticky state
+      if (this.lastHKState === undefined) this.lastHKState = CHCS.OFF;
+
+      let next = this.lastHKState;
+
+      // Primary: explicit operation string
+      if (rawOp === "cooling") next = CHCS.COOL;
+      else if (rawOp === "heating") next = CHCS.HEAT;
+      else if (rawOp === "off") next = CHCS.OFF;
+      else {
+        // Fallback: use demand percentage (treat >=5% as active) and infer side by ambient vs setpoints
+        if (typeof demand === "number") {
+          if (demand >= 5) {
+            if (Number.isFinite(ambientF) && Number.isFinite(this.currentHspF) && Number.isFinite(this.currentCspF)) {
+              if (ambientF >= this.currentCspF) next = CHCS.COOL;
+              else if (ambientF <= this.currentHspF) next = CHCS.HEAT;
+              // else keep previous if we're within deadband
+            } // else keep previous (insufficient context)
+          } else {
+            next = CHCS.OFF;
+          }
+        } // else keep previous — missing data on this tick
       }
 
-      this.service.updateCharacteristic(CHCS, hkState);
+      this.lastHKState = next;
+      this.service.updateCharacteristic(CHCS, next);
+      // Optional debug:
+      // this.log(`[Zone ${this.zoneId}] op=${rawOp || 'n/a'} demand=${demand ?? 'n/a'} -> HK=${next}`);
     }
     // <<< END NEW >>>
 
