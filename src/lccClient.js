@@ -54,6 +54,8 @@ class LccClient {
       throw new Error(`Publish failed: ${res.status}`);
     }
     this.log(`[client] PUBLISH ${dataTopKey}: ${JSON.stringify(body)}`);
+    
+    return res;
   }
 
   async requestData(paths = ["/devices","/equipments","/zones"]) {
@@ -97,24 +99,26 @@ class LccClient {
 
   // Helpers
   async setZoneMode(zoneId, mode) {
-    await this.publish("zones", [
+    const payload = [
       { id: Number(zoneId), status: { period: { systemMode: mode } } }
-    ]);
+    ];
+    this.log(`[client] setZoneMode zone=${zoneId} payload=${JSON.stringify(payload)}`);
+    await this.publish("zones", payload);
   }
 
-  async setZoneSetpoints(zoneId, { csp, hsp, mode }) {
+  async setZoneSetpoints(zoneId, { csp, hsp/*, mode */ }) {
     this.log.warn(`[client] setZoneSetpoints zone=${zoneId} body=${JSON.stringify(body)}`);
     const period = {};
     if (typeof hsp === "number") period.hsp = hsp;
     if (typeof csp === "number") period.csp = csp;
-    if (typeof mode === "string") period.systemMode = mode;
+    //if (typeof mode === "string") period.systemMode = mode;
     // Lennox S40 usually requires a hold instruction
     const payload = [
      {
        id: Number(zoneId),
        status: {
-         period,
-         hold: { type: "permanent" }   // or "temporary" if you want a schedule hold
+         period//,
+         //hold: { type: "permanent" }   // or "temporary" if you want a schedule hold
        }
      }
     ];
@@ -122,8 +126,15 @@ class LccClient {
     this.log(`[client] setZoneSetpoints zone=${zoneId} payload=${JSON.stringify(payload)}`);
 
     // Send it
-    await this.publish("zones", payload);
-    this.log.warn(`[client] response ${res.statusCode} ${res.body}`);
+    try {
+      const res = await this.publish("zones", payload);
+      this.log(`[client] setZoneSetpoints OK`);
+    } catch (e) {
+      this.log(`[/client] setZoneSetpoints failed: ${e?.message || e}`);
+      throw e;
+    }
+    
+    return res.data;
   }
 }
 

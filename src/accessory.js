@@ -65,6 +65,8 @@ class LennoxZoneAccessory {
     this.service.getCharacteristic(this.Characteristic.CurrentTemperature)
       .setProps({ minValue: -40, maxValue: 100, minStep: 0.1 })
       .onGet(() => this.tempC);
+    
+    this.log(`[Zone ${this.zoneId}] wiring handlers…`);
 
     // Cooling threshold (°C): 15.5–32.2 (60–90°F)
     this.service.getCharacteristic(this.Characteristic.CoolingThresholdTemperature)
@@ -73,7 +75,7 @@ class LennoxZoneAccessory {
       .onSet(async (valC) => {
         const cC = clamp(valC, 15.5, 32.2);
         const cF = Math.round(c2f(cC));
-        this.log(`[Zone ${this.zoneId}] set CoolSP -> ${cC.toFixed(1)}°C (${cF}°F)`);
+        this.log(`[Zone ${this.zoneId}] onSet CoolSP -> ${cC.toFixed(1)}°C (${cF}°F)`);
         try {
           await this.platform.client.setZoneSetpoints(this.zoneId, { csp: cF, hsp: this.hspC, mode: this.mode });
           this.cspC = cC;
@@ -82,6 +84,8 @@ class LennoxZoneAccessory {
           throw e;
         }
       });
+      
+      this.log(`[Zone ${this.zoneId}] COOL handler wired`);
 
     // Heating threshold (°C): 10.0–29.4 (50–85°F)
     this.service.getCharacteristic(this.Characteristic.HeatingThresholdTemperature)
@@ -90,7 +94,7 @@ class LennoxZoneAccessory {
       .onSet(async (valC) => {
         const hC = clamp(valC, 10.0, 29.4);
         const hF = Math.round(c2f(hC));
-        this.log(`[Zone ${this.zoneId}] set HeatSP -> ${hC.toFixed(1)}°C (${hF}°F)`);
+        this.log(`[Zone ${this.zoneId}] onSet HeatSP -> ${hC.toFixed(1)}°C (${hF}°F)`);
         try {
           await this.platform.client.setZoneSetpoints(this.zoneId, { csp: this.cspC, hsp: hF, mode: this.mode });
           this.hspC = hC;
@@ -99,6 +103,8 @@ class LennoxZoneAccessory {
           throw e;
         }
       });
+      
+      this.log(`[Zone ${this.zoneId}] HEAT handler wired`);
 
     // Optional humidity
     const humidSvc = this.accessory.getService(this.Service.HumiditySensor)
