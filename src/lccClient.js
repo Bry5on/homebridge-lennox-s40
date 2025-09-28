@@ -53,6 +53,7 @@ class LccClient {
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`Publish failed: ${res.status}`);
     }
+    this.log(`[client] PUBLISH ${dataTopKey}: ${JSON.stringify(body)}`);
   }
 
   async requestData(paths = ["/devices","/equipments","/zones"]) {
@@ -101,7 +102,7 @@ class LccClient {
     ]);
   }
 
-  async setZoneSetpoints(zoneId, { hsp, csp, mode }) {
+  async setZoneSetpoints(zoneId, { csp, hsp, mode }) {
     this.log.warn(`[client] setZoneSetpoints zone=${zoneId} body=${JSON.stringify(body)}`);
     const period = {};
     if (typeof hsp === "number") period.hsp = hsp;
@@ -116,9 +117,9 @@ class LccClient {
          hold: { type: "permanent" }   // or "temporary" if you want a schedule hold
        }
      }
-   ];
+    ];
 
-   this.log(`[client] setZoneSetpoints zone=${zoneId} payload=${JSON.stringify(payload)}`);
+    this.log(`[client] setZoneSetpoints zone=${zoneId} payload=${JSON.stringify(payload)}`);
 
     // Send it
     await this.publish("zones", payload);
