@@ -1,9 +1,10 @@
+// src/lccClient.js
 const axios = require("axios");
 const https = require("https");
 
 class LccClient {
   /**
-   * @param {{host:string, clientId:string, verifyTLS:boolean, longPollSeconds:number, logBodies:boolean, log: Function}} opts
+   * @param {{host:string, clientId?:string, verifyTLS?:boolean, longPollSeconds?:number, logBodies?:boolean, log?: Function}} opts
    */
   constructor(opts) {
     this.host = opts.host;
@@ -39,7 +40,6 @@ class LccClient {
   }
 
   async publish(dataTopKey, payload) {
-    // payload should be the value under top-level key: e.g. { zones: [...] }
     const body = {
       MessageId: Date.now().toString(),
       MessageType: "Command",
@@ -49,12 +49,14 @@ class LccClient {
       AdditionalParameters: { JSONPath: dataTopKey }
     };
     const res = await this.axios.post(`/Messages/Publish`, body);
-    this.log(`Publish -> ${res.status}${this.logBodies && res.data ? ` ${JSON.stringify(res.data).slice(0,200)}` : ""}`);
+    this.log(
+      `Publish -> ${res.status}` +
+      (this.logBodies && res.data ? ` ${JSON.stringify(res.data).slice(0,200)}` : "")
+    );
+    this.log(`[client] PUBLISH ${dataTopKey}: ${JSON.stringify(body)}`);
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`Publish failed: ${res.status}`);
     }
-    this.log(`[client] PUBLISH ${dataTopKey}: ${JSON.stringify(body)}`);
-    
     return res;
   }
 
@@ -64,21 +66,20 @@ class LccClient {
       MessageType: "RequestData",
       SenderId: this.clientId,
       TargetId: "LCC",
-      AdditionalParameters: {
-        JSONPath: `1;${paths.join(";")}`
-      }
+      AdditionalParameters: { JSONPath: `1;${paths.join(";")}` }
     };
     const res = await this.axios.post(`/Messages/RequestData`, body);
-    this.log(`RequestData -> ${res.status}${this.logBodies && res.data ? ` ${JSON.stringify(res.data).slice(0,200)}` : ""}`);
+    this.log(
+      `RequestData -> ${res.status}` +
+      (this.logBodies && res.data ? ` ${JSON.stringify(res.data).slice(0,200)}` : "")
+    );
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`RequestData failed: ${res.status}`);
     }
+    return res.data;
   }
 
-  /**
-   * Long-poll retrieve messages
-   * @returns {Promise<Array<object>>}
-   */
+  // Long-poll retrieve messages
   async retrieve() {
     const params = {
       Direction: "Oldest-to-Newest",
@@ -88,52 +89,51 @@ class LccClient {
     };
     const url = `/Messages/${encodeURIComponent(this.clientId)}/Retrieve`;
     const res = await this.axios.get(url, { params });
-    if (this.logBodies) this.log(`Retrieve -> ${res.status} ${typeof res.data === "object" ? JSON.stringify(res.data).slice(0,200) : String(res.data).slice(0,200)}`);
-    if (res.status !== 200) {
-      throw new Error(`Retrieve failed: ${res.status}`);
+    if (this.logBodies) {
+      this.log(`Retrieve -> ${res.status} ${
+        typeof res.data === "object" ? JSON.stringify(res.data).slice(0,200) : String(res.data).slice(0,200)
+      }`);
+    } else {
+      this.log(`Retrieve -> ${res.status} `);
     }
+    if (res.status !== 200) throw new Error(`Retrieve failed: ${res.status}`);
     const data = res.data;
     if (!data || !Array.isArray(data.messages)) return [];
     return data.messages;
   }
 
-  // Helpers
   async setZoneMode(zoneId, mode) {
-    const payload = [
-      { id: Number(zoneId), status: { period: { systemMode: mode } } }
-    ];
+    const payload = [{ id: Number(zoneId), status: { period: { systemMode: mode } } }];
     this.log(`[client] setZoneMode zone=${zoneId} payload=${JSON.stringify(payload)}`);
-    await this.publish("zones", payload);
+    const res = await this.publish("zones", payload);
+    this.log(`[client] zones publish result -> ${res.status}`);
+    return res.data;
   }
 
-  async setZoneSetpoints(zoneId, { csp, hsp/*, mode */ }) {
-    this.log.warn(`[client] setZoneSetpoints zone=${zoneId} body=${JSON.stringify(body)}`);
+  async setZoneSetpoints(zoneId, { csp, hsp /*, mode */ }) {
     const period = {};
-    if (typeof hsp === "number") period.hsp = hsp;
-    if (typeof csp === "number") period.csp = csp;
-    //if (typeof mode === "string") period.systemMode = mode;
-    // Lennox S40 usually requires a hold instruction
-    const payload = [
-     {
-       id: Number(zoneId),
-       status: {
-         period//,
-         //hold: { type: "permanent" }   // or "temporary" if you want a schedule hold
-       }
-     }
-    ];
+    if (Number.isFinite(hsp)) period.hsp = Math.round(hsp); // °F integer
+    if (Number.isFinite(csp)) period.csp = Math.round(csp); // °F integer
+    // if (typeof mode === "string") period.systemMode = mode;
+
+    // If your S40 needs a hold, uncomment:
+    // const hold = { type: "permanent" };
+
+    const payload = [{
+      id: Number(zoneId),
+      status: {
+        period,
+        // hold
+      }
+    }];
 
     this.log(`[client] setZoneSetpoints zone=${zoneId} payload=${JSON.stringify(payload)}`);
 
-    // Send it
-    try {
-      const res = await this.publish("zones", payload);
-      this.log(`[client] setZoneSetpoints OK`);
-    } catch (e) {
-      this.log(`[/client] setZoneSetpoints failed: ${e?.message || e}`);
-      throw e;
-    }
-    
+    const res = await this.publish("zones", payload);
+    this.log(
+      `[client] zones publish result -> ${res.status}` +
+      (this.logBodies && res.data ? ` ${JSON.stringify(res.data).slice(0,200)}` : "")
+    );
     return res.data;
   }
 }

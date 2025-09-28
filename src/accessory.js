@@ -77,7 +77,7 @@ class LennoxZoneAccessory {
         const cF = Math.round(c2f(cC));
         this.log(`[Zone ${this.zoneId}] onSet CoolSP -> ${cC.toFixed(1)}°C (${cF}°F)`);
         try {
-          await this.platform.client.setZoneSetpoints(this.zoneId, { csp: cF, hsp: this.hspC, mode: this.mode });
+          await this.platform.client.setZoneSetpoints(this.zoneId, { csp: cF });
           this.cspC = cC;
         } catch (e) {
           this.log.error(`[Zone ${this.zoneId}] set csp failed: ${e?.message || e}`);
@@ -96,7 +96,7 @@ class LennoxZoneAccessory {
         const hF = Math.round(c2f(hC));
         this.log(`[Zone ${this.zoneId}] onSet HeatSP -> ${hC.toFixed(1)}°C (${hF}°F)`);
         try {
-          await this.platform.client.setZoneSetpoints(this.zoneId, { csp: this.cspC, hsp: hF, mode: this.mode });
+          await this.platform.client.setZoneSetpoints(this.zoneId, { hsp: hF });
           this.hspC = hC;
         } catch (e) {
           this.log.error(`[Zone ${this.zoneId}] set hsp failed: ${e?.message || e}`);
