@@ -4,6 +4,7 @@
 // and routing setpoint writes through the platform’s schedule writer.
 // Adds a coalesced writer so rapid changes (and device echoes) don’t cause
 // back-to-back writes like: {"hsp":69,"csp":78} then {"hsp":67,"csp":78}.
+// Also reports CurrentRelativeHumidity from zones.status.humidity.
 //
 
 const UUID_NS = "lennox-s40-zone";
@@ -102,6 +103,7 @@ class LennoxZoneAccessory {
     this.currentTempC = 21.0;
     this.currentHspF = 70;
     this.currentCspF = 73;
+    this.currentHumPct = 0;
 
     // Coalesced writer (routes to platform schedule writer)
     this._writer = new CoalescedSetpointWriter(
@@ -128,6 +130,11 @@ class LennoxZoneAccessory {
     this.service.getCharacteristic(this.Characteristic.CurrentTemperature)
       .onGet(() => (typeof this.currentTempC === "number" ? this.currentTempC : 21.0));
 
+    // Current relative humidity (% on the Thermostat tile)
+    this.service.getCharacteristic(this.Characteristic.CurrentRelativeHumidity)
+      .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
+      .onGet(() => (typeof this.currentHumPct === "number" ? this.currentHumPct : 0));
+
     // Thresholds map to HSP/CSP (HomeKit uses °C; cache in °F then convert)
     this.service.getCharacteristic(this.Characteristic.HeatingThresholdTemperature)
       .onGet(() => this.fToC(this.currentHspF ?? 70))
@@ -135,7 +142,8 @@ class LennoxZoneAccessory {
         const newHspF = this.cToF(cVal);
         const newCspF = this.currentCspF ?? 73;
         await this.pushSetpoints(newHspF, newCspF); // coalesced
-      });
+      })
+      .setProps({ minValue: 4.5, maxValue: 32, minStep: 0.5 });
 
     this.service.getCharacteristic(this.Characteristic.CoolingThresholdTemperature)
       .onGet(() => this.fToC(this.currentCspF ?? 73))
@@ -143,12 +151,7 @@ class LennoxZoneAccessory {
         const newCspF = this.cToF(cVal);
         const newHspF = this.currentHspF ?? 70;
         await this.pushSetpoints(newHspF, newCspF); // coalesced
-      });
-
-    // Sane characteristic props for thresholds
-    this.service.getCharacteristic(this.Characteristic.HeatingThresholdTemperature)
-      .setProps({ minValue: 4.5, maxValue: 32, minStep: 0.5 });
-    this.service.getCharacteristic(this.Characteristic.CoolingThresholdTemperature)
+      })
       .setProps({ minValue: 15.5, maxValue: 37, minStep: 0.5 });
 
     // Register with HB
@@ -167,6 +170,12 @@ class LennoxZoneAccessory {
       // Fahrenheit fallback
       this.currentTempC = this.fToC(status.temperature);
       this.service.updateCharacteristic(this.Characteristic.CurrentTemperature, this.currentTempC);
+    }
+
+    // Humidity (%), prefer integer from status.humidity
+    if (typeof status.humidity === "number" && Number.isFinite(status.humidity)) {
+      this.currentHumPct = Math.min(100, Math.max(0, Math.round(status.humidity)));
+      this.service.updateCharacteristic(this.Characteristic.CurrentRelativeHumidity, this.currentHumPct);
     }
 
     // Period setpoints (F/C both appear)
