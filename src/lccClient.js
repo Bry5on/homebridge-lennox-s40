@@ -46,7 +46,7 @@ class LccClient {
       SenderId: this.clientId,
       TargetId: "LCC",
       data: { [dataTopKey]: payload },
-      AdditionalParameters: { JSONPath: dataTopKey }
+      //AdditionalParameters: { JSONPath: dataTopKey }
     };
     const res = await this.axios.post(`/Messages/Publish`, body);
     this.log(
@@ -110,30 +110,22 @@ class LccClient {
     return res.data;
   }
 
-  async setZoneSetpoints(zoneId, { csp, hsp /*, mode */ }) {
+  async setZoneSetpoints(zoneId, { csp, hsp, mode, holdType = "temporary" }) {
     const period = {};
     if (Number.isFinite(hsp)) period.hsp = Math.round(hsp); // °F integer
     if (Number.isFinite(csp)) period.csp = Math.round(csp); // °F integer
-    // if (typeof mode === "string") period.systemMode = mode;
+    //if (typeof mode === "string") period.systemMode = mode;
 
-    // If your S40 needs a hold, uncomment:
-    // const hold = { type: "permanent" };
+    const status = { period };
+    if (holdType) {
+      status.hold = { type: holdType };   // "permanent" or "temporary"
+    }
 
-    const payload = [{
-      id: Number(zoneId),
-      status: {
-        period,
-        // hold
-      }
-    }];
-
+    const payload = [{ id: Number(zoneId), status }];
     this.log(`[client] setZoneSetpoints zone=${zoneId} payload=${JSON.stringify(payload)}`);
 
-    const res = await this.publish("zones", payload);
-    this.log(
-      `[client] zones publish result -> ${res.status}` +
-      (this.logBodies && res.data ? ` ${JSON.stringify(res.data).slice(0,200)}` : "")
-    );
+    const res = await this.publish("zones", payload, "zones/status/period");
+    this.log(`[client] setZoneSetpoints OK`);
     return res.data;
   }
 }
