@@ -56,7 +56,7 @@ class CoalescedSetpointWriter {
 
   async flush() {
     this.timer = undefined;
-       if (!this.pending) return;
+    if (!this.pending) return;
 
     // Skip if nothing changed vs the last known device state
     if (this.lastPublished &&
@@ -109,8 +109,6 @@ class LennoxZoneAccessory {
     this._writer = new CoalescedSetpointWriter(
       (m, ...a) => this.log(`[Zone ${this.zoneId}] ${m}`, ...a),
       async ({ hspF, cspF }) => {
-        // Platform function known-good in your logs:
-        // writes to the hold schedule (id=32) period 0 for this zone.
         const h = Math.round(hspF);
         const c = Math.round(cspF);
         await this.platform.setZoneSetpointsViaSchedule(this.zoneId, { hsp: h, csp: c });
@@ -139,8 +137,21 @@ class LennoxZoneAccessory {
     this.service.getCharacteristic(this.Characteristic.HeatingThresholdTemperature)
       .onGet(() => this.fToC(this.currentHspF ?? 70))
       .onSet(async (cVal) => {
+        // Deadband-enforcing setter: if user raises HSP too close to CSP,
+        // bump CSP up to maintain >= 3°F gap and reflect it immediately in HK.
         const newHspF = this.cToF(cVal);
-        const newCspF = this.currentCspF ?? 73;
+        let newCspF = this.currentCspF ?? 73;
+
+        if (Number.isFinite(newHspF) && Number.isFinite(newCspF) && (newCspF - newHspF) < 3) {
+          newCspF = newHspF + 3;
+          // Move the *other* slider in the Home UI right away
+          this.currentCspF = Math.round(newCspF);
+          this.service.updateCharacteristic(
+            this.Characteristic.CoolingThresholdTemperature,
+            this.fToC(this.currentCspF)
+          );
+        }
+
         await this.pushSetpoints(newHspF, newCspF); // coalesced
       })
       .setProps({ minValue: 4.5, maxValue: 32, minStep: 0.5 });
@@ -148,8 +159,21 @@ class LennoxZoneAccessory {
     this.service.getCharacteristic(this.Characteristic.CoolingThresholdTemperature)
       .onGet(() => this.fToC(this.currentCspF ?? 73))
       .onSet(async (cVal) => {
+        // Deadband-enforcing setter: if user lowers CSP too close to HSP,
+        // pull HSP down to maintain >= 3°F gap and reflect it immediately in HK.
         const newCspF = this.cToF(cVal);
-        const newHspF = this.currentHspF ?? 70;
+        let newHspF = this.currentHspF ?? 70;
+
+        if (Number.isFinite(newHspF) && Number.isFinite(newCspF) && (newCspF - newHspF) < 3) {
+          newHspF = newCspF - 3;
+          // Move the *other* slider in the Home UI right away
+          this.currentHspF = Math.round(newHspF);
+          this.service.updateCharacteristic(
+            this.Characteristic.HeatingThresholdTemperature,
+            this.fToC(this.currentHspF)
+          );
+        }
+
         await this.pushSetpoints(newHspF, newCspF); // coalesced
       })
       .setProps({ minValue: 15.5, maxValue: 37, minStep: 0.5 });
@@ -199,49 +223,34 @@ class LennoxZoneAccessory {
       );
     }
 
-    // >>> NEW: stable CurrentHeatingCoolingState from op/demand (sticky to avoid flicker)
+    // Stable CurrentHeatingCoolingState from op/demand (sticky to avoid flicker)
     {
       const CHCS = this.Characteristic.CurrentHeatingCoolingState;
-
-      // Signals from the S40 (seen in your shell output)
-      const rawOp = (status.tempOperation || status.op || "").toString().toLowerCase(); // "cooling" | "heating" | "off"
+      const rawOp = (status.tempOperation || status.op || "").toString().toLowerCase();
       const demand = (typeof status.demand === "number") ? status.demand : undefined;
-
-      // Ambient in °F for fallback inference
       const ambientF = (typeof status.temperature === "number")
         ? Math.round(status.temperature)
         : (typeof status.temperatureC === "number" ? Math.round(this.cToF(status.temperatureC)) : undefined);
-
-      // initialize sticky state
       if (this.lastHKState === undefined) this.lastHKState = CHCS.OFF;
-
       let next = this.lastHKState;
-
-      // Primary: explicit operation string
       if (rawOp === "cooling") next = CHCS.COOL;
       else if (rawOp === "heating") next = CHCS.HEAT;
       else if (rawOp === "off") next = CHCS.OFF;
       else {
-        // Fallback: use demand percentage (treat >=5% as active) and infer side by ambient vs setpoints
         if (typeof demand === "number") {
           if (demand >= 5) {
             if (Number.isFinite(ambientF) && Number.isFinite(this.currentHspF) && Number.isFinite(this.currentCspF)) {
               if (ambientF >= this.currentCspF) next = CHCS.COOL;
               else if (ambientF <= this.currentHspF) next = CHCS.HEAT;
-              // else keep previous if we're within deadband
-            } // else keep previous (insufficient context)
+            }
           } else {
             next = CHCS.OFF;
           }
-        } // else keep previous — missing data on this tick
+        }
       }
-
       this.lastHKState = next;
       this.service.updateCharacteristic(CHCS, next);
-      // Optional debug:
-      // this.log(`[Zone ${this.zoneId}] op=${rawOp || 'n/a'} demand=${demand ?? 'n/a'} -> HK=${next}`);
     }
-    // <<< END NEW >>>
 
     // Feed device echo to writer so it treats it as an ACK / latest truth
     this._writer.onDeviceEcho({ hspF: this.currentHspF, cspF: this.currentCspF });
