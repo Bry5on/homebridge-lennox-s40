@@ -1,140 +1,121 @@
-// src/lccClient.js
-const axios = require("axios");
+// lccClient.js
+//
+// Minimal LCC client used by the LennoxS40 Homebridge platform.
+// Adds schedule-based setpoint writer + endpoint Connect helper.
+
 const https = require("https");
+const axiosLib = require("axios");
 
 class LccClient {
-  /**
-   * @param {{host:string, clientId?:string, verifyTLS?:boolean, longPollSeconds?:number, logBodies?:boolean, log?: Function}} opts
-   */
   constructor(opts) {
-    this.host = opts.host;
+    this.host = opts.host;                               // e.g. https://192.168.1.10
     this.clientId = opts.clientId || "homebridge";
     this.verifyTLS = !!opts.verifyTLS;
-    this.longPollSeconds = opts.longPollSeconds || 15;
+    this.longPollSeconds = Number(opts.longPollSeconds || 15);
     this.logBodies = !!opts.logBodies;
-    this.log = opts.log || (()=>{});
-    this.connected = false;
+    this.log = typeof opts.log === "function" ? opts.log : () => {};
 
-    this.axios = axios.create({
-      baseURL: `https://${this.host}`,
-      timeout: 30000,
-      httpsAgent: new https.Agent({ rejectUnauthorized: this.verifyTLS }),
-      validateStatus: () => true
+    // Axios w/ relaxed TLS if requested
+    const agent = new https.Agent({ rejectUnauthorized: this.verifyTLS });
+    this.axios = axiosLib.create({
+      baseURL: this.host.replace(/\/+$/, ""),            // no trailing slash
+      httpsAgent: agent,
+      timeout: 20000,
+      headers: { "Content-Type": "application/json" },
+      // device sometimes closes idle keep-alives; don’t keep sockets forever
+      maxRedirects: 0,
+      // no proxy
+      proxy: false
     });
   }
 
+  // Establishes server-side message session for SenderId (you) — stays cheap.
   async connect() {
-    const res = await this.axios.post(`/Endpoints/${encodeURIComponent(this.clientId)}/Connect`);
-    this.log(`Connect -> ${res.status}`);
-    if (res.status >= 200 && res.status < 300) {
-      this.connected = true;
-      return;
+    // The S40 doesn’t strictly require this call before Publish/RequestData,
+    // but it’s harmless and gives a deterministic “session”.
+    this.log(`[client] Connect -> POST /Messages/${encodeURIComponent(this.clientId)}/Connect`);
+    try {
+      const url = `/Messages/${encodeURIComponent(this.clientId)}/Connect`;
+      const res = await this.axios.post(url);
+      this.log(`[client] Connect -> ${res.status}`);
+    } catch (e) {
+      // Some firmwares 204 here; treat as soft.
+      this.log(`[client] Connect soft error: ${e.message}`);
     }
-    throw new Error(`Connect failed: ${res.status}`);
   }
 
-  async disconnect() {
-    const res = await this.axios.post(`/Endpoints/${encodeURIComponent(this.clientId)}/Disconnect`);
-    this.log(`Disconnect -> ${res.status}`);
-    this.connected = false;
-  }
-
-  async publish(dataTopKey, payload) {
-    const body = {
-      MessageId: Date.now().toString(),
-      MessageType: "Command",
-      SenderId: this.clientId,
-      TargetId: "LCC",
-      data: { [dataTopKey]: payload },
-      //AdditionalParameters: { JSONPath: dataTopKey }
-    };
-    const res = await this.axios.post(`/Messages/Publish`, body);
-    this.log(
-      `Publish -> ${res.status}` +
-      (this.logBodies && res.data ? ` ${JSON.stringify(res.data).slice(0,200)}` : "")
-    );
-    this.log(`[client] PUBLISH ${dataTopKey}: ${JSON.stringify(body)}`);
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Publish failed: ${res.status}`);
+  // Optional: explicitly open an Endpoint session to prevent “no active connection”
+  async connectEndpoint() {
+    try {
+      const url = `/Endpoints/${encodeURIComponent(this.clientId)}/Connect`;
+      const res = await this.axios.post(url);
+      this.log(`[client] ConnectEndpoint -> ${res.status}`);
+      return res.status;
+    } catch (e) {
+      this.log(`[client] ConnectEndpoint soft error: ${e.message}`);
+      return 0;
     }
-    return res;
   }
 
-  async requestData(paths = ["/devices","/equipments","/zones"]) {
+  // Ask the S40 to push objects back via PropertyChange (“1;” prefix means “since 1”)
+  async requestData(paths /* array of “/zones”, “/devices”, ... */) {
+    const jsonPath = `1;${paths.join(";")}`;
     const body = {
       MessageId: Date.now().toString(),
       MessageType: "RequestData",
       SenderId: this.clientId,
       TargetId: "LCC",
-      AdditionalParameters: { JSONPath: `1;${paths.join(";")}` }
+      AdditionalParameters: { JSONPath: jsonPath }
     };
+    this.log(`[client] RequestData -> ${jsonPath}`);
     const res = await this.axios.post(`/Messages/RequestData`, body);
-    this.log(
-      `RequestData -> ${res.status}` +
-      (this.logBodies && res.data ? ` ${JSON.stringify(res.data).slice(0,200)}` : "")
-    );
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`RequestData failed: ${res.status}`);
-    }
+    this.log(`[client] RequestData -> ${res.status} ${this.logBodies ? JSON.stringify(res.data) : ""}`);
     return res.data;
   }
 
-  // Long-poll retrieve messages
-  async retrieve() {
+  // Long-poll retrieve any messages for our SenderId
+  async retrieve({ startTime = 1, count = 50, timeoutSec = this.longPollSeconds } = {}) {
+    const url = `/Messages/${encodeURIComponent(this.clientId)}/Retrieve`;
     const params = {
       Direction: "Oldest-to-Newest",
-      MessageCount: "10",
-      StartTime: "1",
-      LongPollingTimeout: String(this.longPollSeconds)
+      MessageCount: String(count),
+      StartTime: String(startTime),
+      LongPollingTimeout: String(timeoutSec)
     };
-    const url = `/Messages/${encodeURIComponent(this.clientId)}/Retrieve`;
     const res = await this.axios.get(url, { params });
-    if (this.logBodies) {
-      this.log(`Retrieve -> ${res.status} ${
-        typeof res.data === "object" ? JSON.stringify(res.data).slice(0,200) : String(res.data).slice(0,200)
-      }`);
-    } else {
-      this.log(`Retrieve -> ${res.status} `);
-    }
-    if (res.status !== 200) throw new Error(`Retrieve failed: ${res.status}`);
-    const data = res.data;
-    if (!data || !Array.isArray(data.messages)) return [];
-    return data.messages;
+    // 204 (no content) can happen – normalize to empty list
+    if (!res.data || !res.data.messages) return [];
+    if (this.logBodies) this.log(`[client] Retrieve -> ${JSON.stringify(res.data).slice(0, 300)}...`);
+    return res.data.messages;
   }
 
-  async setZoneMode(zoneId, mode) {
-    const payload = [{ id: Number(zoneId), status: { period: { systemMode: mode } } }];
-    this.log(`[client] setZoneMode zone=${zoneId} payload=${JSON.stringify(payload)}`);
-    const res = await this.publish("zones", payload);
-    this.log(`[client] zones publish result -> ${res.status}`);
-    return res.data;
-  }
-
-  async setZoneSetpoints(zoneId, { csp, hsp, mode, holdType = "temporary" }) {
-    const period = {};
-    if (Number.isFinite(hsp)) period.hsp = Math.round(hsp); // °F integer
-    if (Number.isFinite(csp)) period.csp = Math.round(csp); // °F integer
-    //if (typeof mode === "string") period.systemMode = mode;
-
-    const status = { period };
-    if (holdType) {
-      status.hold = { type: holdType };   // "permanent" or "temporary"
-    }
-
-    const payload = [{ id: Number(zoneId), status }];
-    this.log(`[client] setZoneSetpoints zone=${zoneId} payload=${JSON.stringify(payload)}`);
-
+  // **** S E T P O I N T S   V I A   S C H E D U L E ****
+  // Write a single period object into a schedule/period (this is what the S40 honors).
+  async setSchedulePeriod(scheduleId, periodId, period) {
+    const safeScheduleId = Number(scheduleId);
+    const safePeriodId = Number(periodId);
     const body = {
-	  MessageId: Date.now().toString(),
-	  MessageType: "Command",
-	  SenderId: this.clientId,
-	  TargetId: "LCC",
-	  data: { zones: payload },
-	  AdditionalParameters: { JSONPath: "zones/status" }
+      MessageId: Date.now().toString(),
+      MessageType: "Command",
+      SenderId: this.clientId,
+      TargetId: "LCC",
+      data: {
+        schedules: [
+          {
+            id: safeScheduleId,
+            schedule: {
+              periods: [{ id: safePeriodId, period }]
+            }
+          }
+        ]
+      },
+      AdditionalParameters: {
+        JSONPath: `schedules[id=${safeScheduleId}]/schedule/periods[id=${safePeriodId}]/period`
+      }
     };
-    
+    this.log(`[client] setSchedulePeriod sid=${safeScheduleId} pid=${safePeriodId} body=${JSON.stringify(body.data)}`);
     const res = await this.axios.post(`/Messages/Publish`, body);
-    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data).slice(0,200) : ""}`);
+    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
     if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
     return res.data;
   }
