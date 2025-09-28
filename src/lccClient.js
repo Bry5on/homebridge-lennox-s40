@@ -124,8 +124,18 @@ class LccClient {
     const payload = [{ id: Number(zoneId), status }];
     this.log(`[client] setZoneSetpoints zone=${zoneId} payload=${JSON.stringify(payload)}`);
 
-    const res = await this.publish("zones", payload, "zones/status/period");
-    this.log(`[client] setZoneSetpoints OK`);
+    const body = {
+	  MessageId: Date.now().toString(),
+	  MessageType: "Command",
+	  SenderId: this.clientId,
+	  TargetId: "LCC",
+	  data: { zones: payload },
+	  AdditionalParameters: { JSONPath: "zones/status" }
+    };
+    
+    const res = await this.axios.post(`/Messages/Publish`, body);
+    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data).slice(0,200) : ""}`);
+    if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
     return res.data;
   }
 }
