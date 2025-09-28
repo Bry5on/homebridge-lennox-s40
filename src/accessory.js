@@ -199,6 +199,34 @@ class LennoxZoneAccessory {
       );
     }
 
+    // >>> NEW: update CurrentHeatingCoolingState from device state <<<
+    {
+      const CHCS = this.Characteristic.CurrentHeatingCoolingState;
+      const op = (status.tempOperation || "").toLowerCase(); // "heating" | "cooling" | "off" | etc.
+      const demand = Number.isFinite(status.demand) ? status.demand : 0;
+
+      // Ambient in °F (for fallback comparisons)
+      const ambientF = Number.isFinite(status.temperature)
+        ? status.temperature
+        : (Number.isFinite(status.temperatureC) ? this.cToF(status.temperatureC) : undefined);
+
+      let hkState = CHCS.OFF;
+
+      if (op === "heating") {
+        hkState = CHCS.HEAT;
+      } else if (op === "cooling") {
+        hkState = CHCS.COOL;
+      } else if (demand > 0 && ambientF !== undefined &&
+                 Number.isFinite(this.currentHspF) && Number.isFinite(this.currentCspF)) {
+        // Fallback: infer from demand + ambient vs setpoints
+        if (ambientF >= this.currentCspF) hkState = CHCS.COOL;
+        else if (ambientF <= this.currentHspF) hkState = CHCS.HEAT;
+      }
+
+      this.service.updateCharacteristic(CHCS, hkState);
+    }
+    // <<< END NEW >>>
+
     // Feed device echo to writer so it treats it as an ACK / latest truth
     this._writer.onDeviceEcho({ hspF: this.currentHspF, cspF: this.currentCspF });
   }
