@@ -1,8 +1,11 @@
 // index.js
 //
 // Homebridge platform for Lennox S40.
-// Key change: route setpoints through schedule writer (hold scheduleId),
-// cache it from live zone config, and keep an endpoint session alive.
+//
+// Reliable setpoint writes:
+//  1) Write the hold schedule’s period 0 with {hsp,csp}
+//  2) Arm a temporary hold pointing at that schedule (try multiple paths)
+//  3) Nudge /zones so UI updates quickly
 
 const { LccClient } = require("./lccClient");
 const { LennoxZoneAccessory } = require("./accessory");
@@ -39,20 +42,16 @@ class LennoxS40Platform {
 
     this.zoneAccessories = new Map();
 
-    // cache: zoneId -> hold scheduleId (default 32 until we learn otherwise)
+    // cache: zoneId -> hold scheduleId (default 32 + zoneId)
     this.holdScheduleId = new Map();
-    for (const zid of this.zoneIds) this.holdScheduleId.set(zid, 32);
+    for (const zid of this.zoneIds) this.holdScheduleId.set(zid, 32 + zid);
 
     api.on("didFinishLaunching", async () => {
       try {
-        // Create sessions up-front
         await this.client.connect();
         await this.client.connectEndpoint();
-
-        // Seed data so we can discover scheduleHold.scheduleId
         await this.client.requestData(["/devices", "/equipments", "/zones"]);
 
-        // Register zones
         for (const zoneId of this.zoneIds) {
           if (!this.zoneAccessories.has(zoneId)) {
             const acc = new LennoxZoneAccessory(this, zoneId);
@@ -68,17 +67,88 @@ class LennoxS40Platform {
   }
 
   configureAccessory() {
-    // We register fresh accessories at launch; Homebridge caches them.
+    // Fresh registration each launch; HB caches them.
   }
 
   // Central helper used by accessories to write setpoints
+  // Sequence:
+  //  1) Write hold schedule period 0
+  //  2) Arm hold (try config->enabled, then setScheduleHold, then status.hold)
   async setZoneSetpointsViaSchedule(zoneId, { hsp, csp }) {
-    const sid = this.holdScheduleId.get(zoneId) ?? 32;
+    const sid = this.holdScheduleId.get(zoneId) ?? (32 + zoneId);
     const period = {};
     if (Number.isFinite(hsp)) period.hsp = Math.round(hsp);
     if (Number.isFinite(csp)) period.csp = Math.round(csp);
-    this.log(`[LennoxS40] zone=${zoneId} write scheduleId=${sid} periodId=0 payload=${JSON.stringify(period)}`);
-    return this.client.setSchedulePeriod(sid, 0, period);
+
+    // (1) Update the period first
+    this.log(`[LennoxS40] zone=${zoneId} scheduleId=${sid} periodId=0 write -> ${JSON.stringify(period)}`);
+    await this.client.setSchedulePeriod(sid, 0, period);
+
+    // tiny pause so S40 snapshots period before arming hold
+    await new Promise((r) => setTimeout(r, 150));
+
+    // (2) Arm a temp hold that points at that schedule — try multiple ways
+    const desiredHold = {
+      type: "temporary",
+      expirationMode: "nextPeriod",
+      scheduleId: sid,
+      period, // some firmwares like the temps echoed here
+    };
+
+    // Try zones/config/scheduleHold.enabled=true
+    let holdArmed = false;
+    if (typeof this.client.setZoneConfigScheduleHold === "function") {
+      try {
+        await this.client.setZoneConfigScheduleHold(zoneId, {
+          enabled: true,
+          exceptionType: "hold",
+          scheduleId: sid,
+          expirationMode: "nextPeriod",
+          expiresOn: "0"
+        });
+        this.log(`[LennoxS40] zone=${zoneId} armed hold via zones/config/scheduleHold`);
+        holdArmed = true;
+      } catch (e) {
+        this.log.warn(`[LennoxS40] zones/config/scheduleHold failed: ${e.message}`);
+      }
+    }
+
+    // Fallback: zones/command/setScheduleHold
+    if (!holdArmed && typeof this.client.setScheduleHold === "function") {
+      try {
+        await this.client.setScheduleHold(zoneId, sid, {
+          hsp: period.hsp,
+          csp: period.csp,
+          type: "temporary",
+          expirationMode: "nextPeriod"
+        });
+        this.log(`[LennoxS40] zone=${zoneId} armed hold via setScheduleHold`);
+        holdArmed = true;
+      } catch (e) {
+        this.log.warn(`[LennoxS40] setScheduleHold failed: ${e.message}`);
+      }
+    }
+
+    // Last resort: zones/status/hold
+    if (!holdArmed && typeof this.client.setZoneHoldStatus === "function") {
+      try {
+        await this.client.setZoneHoldStatus(zoneId, {
+          type: "temporary",
+          expirationMode: "nextPeriod"
+        });
+        this.log(`[LennoxS40] zone=${zoneId} armed hold via zones/status/hold`);
+        holdArmed = true;
+      } catch (e) {
+        this.log.warn(`[LennoxS40] zones/status/hold failed: ${e.message}`);
+      }
+    }
+
+    // Nudge for immediate UI refresh
+    try { await this.client.requestData(["/zones"]); } catch {}
+
+    if (!holdArmed) {
+      this.log.warn("[LennoxS40] Hold might not be armed (no supported hold method succeeded).");
+    }
   }
 
   async startPump() {
@@ -92,13 +162,12 @@ class LennoxS40Platform {
           if (!m || !m.Data) continue;
           const data = m.Data;
 
-          // zones-based updates
           if (Array.isArray(data.zones)) {
             for (const z of data.zones) {
               const zoneId = typeof z.id === "number" ? z.id : undefined;
               if (zoneId == null) continue;
 
-              // capture hold schedule id if present
+              // learn/refresh the hold schedule id
               const schedHold = z.config && z.config.scheduleHold;
               if (schedHold && typeof schedHold.scheduleId === "number") {
                 const existing = this.holdScheduleId.get(zoneId);
@@ -108,21 +177,16 @@ class LennoxS40Platform {
                 }
               }
 
-              // push status to accessory
               const acc = this.zoneAccessories.get(zoneId);
               if (acc && z.status) acc.applyZoneStatus(z.status);
             }
           }
-
-          // (Optional) You’ll also see “schedules” PropertyChange after writes.
         }
       } catch (e) {
         this.log.warn(`[LennoxS40] Retrieve error: ${e.message}`);
-        // Reconnect & re-open endpoint session, then backoff
         try { await this.client.connect(); } catch {}
         try { await this.client.connectEndpoint(); } catch {}
-
-        await new Promise(r => setTimeout(r, backoff * 1000));
+        await new Promise((r) => setTimeout(r, backoff * 1000));
         backoff = Math.min(backoff * 2, 60);
       }
     }

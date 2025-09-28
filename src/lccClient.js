@@ -72,6 +72,30 @@ class LccClient {
     this.log(`[client] RequestData -> ${res.status} ${this.logBodies ? JSON.stringify(res.data) : ""}`);
     return res.data;
   }
+  
+  // Add inside class LccClient
+async setZoneConfigScheduleHold(zoneId, scheduleHoldObj) {
+  const zid = Number(zoneId);
+  const body = {
+    MessageId: Date.now().toString(),
+    MessageType: "Command",
+    SenderId: this.clientId,
+    TargetId: "LCC",
+    data: {
+      zones: [
+        { id: zid, config: { scheduleHold: scheduleHoldObj } }
+      ]
+    },
+    AdditionalParameters: {
+      JSONPath: `zones[id=${zid}]/config/scheduleHold`
+    }
+  };
+  this.log(`[client] setZoneConfigScheduleHold zid=${zid} body=${JSON.stringify(body.data)}`);
+  const res = await this.axios.post(`/Messages/Publish`, body);
+  this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
+  if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
+  return res.data;
+}
 
   // Long-poll retrieve any messages for our SenderId
   async retrieve({ startTime = 1, count = 50, timeoutSec = this.longPollSeconds } = {}) {
@@ -87,6 +111,30 @@ class LccClient {
     if (!res.data || !res.data.messages) return [];
     if (this.logBodies) this.log(`[client] Retrieve -> ${JSON.stringify(res.data).slice(0, 300)}...`);
     return res.data.messages;
+  }
+  
+  // Fallback nudge: set hold via zones/status path (TargetId: tstat)
+  async setZoneHoldStatus(zoneId, { type = "temporary", expirationMode = "nextPeriod" } = {}) {
+    const zid = Number(zoneId);
+    const body = {
+      MessageId: Date.now().toString(),
+      MessageType: "PropertyChange",
+      SenderId: this.clientId,
+      TargetId: "tstat",
+      data: {
+        zones: [
+          { id: zid, status: { hold: { type, expirationMode } } }
+        ]
+      },
+      AdditionalParameters: {
+        JSONPath: `zones[id=${zid}]/status/hold`
+      }
+    };
+    this.log(`[client] setZoneHoldStatus zid=${zid} body=${JSON.stringify(body.data)}`);
+    const res = await this.axios.post(`/Messages/Publish`, body);
+    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
+    if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
+    return res.data;
   }
 
   // **** S E T P O I N T S   V I A   S C H E D U L E ****
@@ -114,6 +162,47 @@ class LccClient {
       }
     };
     this.log(`[client] setSchedulePeriod sid=${safeScheduleId} pid=${safePeriodId} body=${JSON.stringify(body.data)}`);
+    const res = await this.axios.post(`/Messages/Publish`, body);
+    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
+    if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
+    return res.data;
+  }
+
+  // **** N E W :   A C T I V A T E   H O L D   W I T H   S E T P O I N T S ****
+  // Tells zone to enter a hold on a particular scheduleId (usually the zone’s hold schedule),
+  // and sets the period’s hsp/csp that the thermostat will follow immediately.
+  async setScheduleHold(zoneId, scheduleId, { hsp, csp, type = "temporary", expirationMode = "nextPeriod", duration } = {}) {
+    const safeZoneId = Number(zoneId);
+    const safeScheduleId = Number(scheduleId);
+
+    const body = {
+      MessageId: Date.now().toString(),
+      MessageType: "Command",
+      SenderId: this.clientId,
+      TargetId: "LCC",
+      data: {
+        zones: [
+          {
+            id: safeZoneId,
+            command: {
+              setScheduleHold: {
+                type,                   // "temporary" | "permanent"
+                expirationMode,         // commonly "nextPeriod"
+                scheduleId: safeScheduleId,
+                ...(Number.isFinite(duration) ? { duration: Math.round(duration) } : {}),
+                period: {}
+              }
+            }
+          }
+        ]
+      },
+      AdditionalParameters: { JSONPath: "zones/command/setScheduleHold" }
+    };
+
+    if (Number.isFinite(hsp)) body.data.zones[0].command.setScheduleHold.period.hsp = Math.round(hsp);
+    if (Number.isFinite(csp)) body.data.zones[0].command.setScheduleHold.period.csp = Math.round(csp);
+
+    this.log(`[client] setScheduleHold zid=${safeZoneId} sid=${safeScheduleId} body=${JSON.stringify(body.data)}`);
     const res = await this.axios.post(`/Messages/Publish`, body);
     this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
     if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
