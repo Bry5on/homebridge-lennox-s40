@@ -1,228 +1,168 @@
-// src/accessory.js
-
-const MODE_TO_HOMEKIT = {
-  "off": 0,           // Characteristic.TargetHeatingCoolingState.OFF
-  "heat": 1,          // ...HEAT
-  "cool": 2,          // ...COOL
-  "heat and cool": 3, // ...AUTO
-};
+// accessory.js
+const MODE_TO_HOMEKIT = { off: 0, heat: 1, cool: 2, "heat and cool": 3 };
 const HOMEKIT_TO_MODE = ["off", "heat", "cool", "heat and cool"];
 
-/**
- * Represents one Lennox S40 zone as a HomeKit Thermostat (+ Humidity).
- *
- * Expected platform contract:
- *   - platform.log           : logger
- *   - platform.Service       : HAP Service
- *   - platform.Characteristic: HAP Characteristic
- *   - platform.client        : has .command(body) to talk to the S40
- *
- * index.js should:
- *   - new LennoxZoneAccessory(platform, accessory, zoneId)
- *   - call .applyZoneStatus(status) as updates arrive
- */
+// Unit helpers
+const f2c = (f) => (Number(f) - 32) * 5 / 9;
+const c2f = (c) => (Number(c) * 9 / 5) + 32;
+const clamp = (v, min, max) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, n));
+};
+
 class LennoxZoneAccessory {
-  constructor(platform, accessory, zoneId) {
-    this.platform  = platform;
-    this.log       = platform.log;
-    this.accessory = accessory;
-    this.zoneId    = zoneId;
-
+  constructor(platform, zoneId) {
+    this.platform = platform;
+    this.zoneId = zoneId;
     this.name = `Lennox Zone ${zoneId}`;
+    this.log = platform.log;
 
-    // --- cached state (Celsius in cache to match HAP) ---
-    this.curTempC = 21;   // default 70°F
-    this.hspC     = 20;   // ~68°F
-    this.cspC     = 23;   // ~73°F
+    // Use the platform's HAP singletons
+    this.Service = platform.Service;
+    this.Characteristic = platform.Characteristic;
+
+    // Internal state (HomeKit expects °C)
+    // Provide safe defaults within HomeKit ranges so no warnings appear
+    this.haveFirstStatus = false;
+    this.tempC = 22.0;      // ~72°F
     this.humidity = 50;
-    this.currentOperation = "off";        // "heating" | "cooling" | "off"
-    this.targetMode       = "heat and cool";
+    this.mode = "off";
+    this.hspC = 20.5;       // ~69°F  (>= 10.0°C)
+    this.cspC = 23.0;       // ~73°F  (>= 15.5°C)
 
-    // ---------- Services ----------
-    const { Service, Characteristic } = this.platform;
+    const accUuid = platform.api.hap.uuid.generate(`${platform.host}-${zoneId}`);
+    this.accessory = new platform.api.platformAccessory(this.name, accUuid);
 
-    this.thermo = this.accessory.getService(Service.Thermostat)
-      || this.accessory.addService(Service.Thermostat, this.name);
+    // Main Thermostat service
+    this.service = this.accessory.getService(this.Service.Thermostat)
+      || this.accessory.addService(this.Service.Thermostat, this.name);
 
-    // Cosmetic: show °F in the Home app (HAP values still stay °C)
-    this.thermo.updateCharacteristic(Characteristic.TemperatureDisplayUnits, 1); // 0=C, 1=F
+    // DO NOT force TemperatureDisplayUnits; let Home decide (iOS setting).
+    // We always send °C to HomeKit characteristics.
 
-    // Threshold characteristics are °C in HAP
-    this.thermo.getCharacteristic(Characteristic.CoolingThresholdTemperature)
-      .setProps({ minValue: 10, maxValue: 35, minStep: 0.5 })
-      .onGet(() => this.cspC)
-      .onSet(v => this.setCoolC(v));
+    // Current state (OFF/HEAT/COOL)
+    this.service.getCharacteristic(this.Characteristic.CurrentHeatingCoolingState)
+      .onGet(() => this._currentState());
 
-    this.thermo.getCharacteristic(Characteristic.HeatingThresholdTemperature)
-      .setProps({ minValue: 0, maxValue: 25, minStep: 0.5 })
-      .onGet(() => this.hspC)
-      .onSet(v => this.setHeatC(v));
+    // Target mode
+    this.service.getCharacteristic(this.Characteristic.TargetHeatingCoolingState)
+      .setProps({ validValues: [0, 1, 2, 3] })
+      .onGet(() => MODE_TO_HOMEKIT[this.mode] ?? 0)
+      .onSet(async (value) => {
+        const mode = HOMEKIT_TO_MODE[value] || "off";
+        this.log(`[Zone ${this.zoneId}] set TargetMode -> ${mode}`);
+        try {
+          await this.platform.client.setZoneMode(this.zoneId, mode);
+          this.mode = mode;
+        } catch (e) {
+          this.log.error(`[Zone ${this.zoneId}] setZoneMode failed: ${e?.message || e}`);
+          throw e;
+        }
+      });
 
-    this.thermo.getCharacteristic(Characteristic.CurrentTemperature)
+    // Current temperature (°C)
+    this.service.getCharacteristic(this.Characteristic.CurrentTemperature)
       .setProps({ minValue: -40, maxValue: 100, minStep: 0.1 })
-      .onGet(() => this.curTempC);
+      .onGet(() => this.tempC);
 
-    this.thermo.getCharacteristic(Characteristic.CurrentHeatingCoolingState)
-      .onGet(() => this.mapCurrentState(this.currentOperation));
+    // Cooling threshold (°C): 15.5–32.2 (60–90°F)
+    this.service.getCharacteristic(this.Characteristic.CoolingThresholdTemperature)
+      .setProps({ minValue: 15.5, maxValue: 32.2, minStep: 0.1 })
+      .onGet(() => clamp(this.cspC, 15.5, 32.2))
+      .onSet(async (valC) => {
+        const cC = clamp(valC, 15.5, 32.2);
+        const cF = Math.round(c2f(cC));
+        this.log(`[Zone ${this.zoneId}] set CoolSP -> ${cC.toFixed(1)}°C (${cF}°F)`);
+        try {
+          await this.platform.client.setZoneSetpoints(this.zoneId, { csp: cF, hsp: hF, mode: this.mode });
+          this.cspC = cC;
+        } catch (e) {
+          this.log.error(`[Zone ${this.zoneId}] set csp failed: ${e?.message || e}`);
+          throw e;
+        }
+      });
 
-    this.thermo.getCharacteristic(Characteristic.TargetHeatingCoolingState)
-      .onGet(() => MODE_TO_HOMEKIT[this.targetMode] ?? 0)
-      .onSet(v => this.setMode(HOMEKIT_TO_MODE[v] ?? "off"));
+    // Heating threshold (°C): 10.0–29.4 (50–85°F)
+    this.service.getCharacteristic(this.Characteristic.HeatingThresholdTemperature)
+      .setProps({ minValue: 10.0, maxValue: 29.4, minStep: 0.1 })
+      .onGet(() => clamp(this.hspC, 10.0, 29.4))
+      .onSet(async (valC) => {
+        const hC = clamp(valC, 10.0, 29.4);
+        const hF = Math.round(c2f(hC));
+        this.log(`[Zone ${this.zoneId}] set HeatSP -> ${hC.toFixed(1)}°C (${hF}°F)`);
+        try {
+          await this.platform.client.setZoneSetpoints(this.zoneId, { csp: cF, hsp: hF, mode: this.mode });
+          this.hspC = hC;
+        } catch (e) {
+          this.log.error(`[Zone ${this.zoneId}] set hsp failed: ${e?.message || e}`);
+          throw e;
+        }
+      });
 
-    // Humidity service (optional but nice)
-    this.humidSvc = this.accessory.getService(Service.HumiditySensor)
-      || this.accessory.addService(Service.HumiditySensor, `${this.name} Humidity`);
-    this.humidSvc.getCharacteristic(Characteristic.CurrentRelativeHumidity)
+    // Optional humidity
+    const humidSvc = this.accessory.getService(this.Service.HumiditySensor)
+      || this.accessory.addService(this.Service.HumiditySensor, `${this.name} Humidity`);
+    humidSvc.getCharacteristic(this.Characteristic.CurrentRelativeHumidity)
       .onGet(() => this.humidity);
 
-    // Accessory Info (avoid empty serials)
-    this.accessory.getService(Service.AccessoryInformation)
-      .setCharacteristic(Characteristic.Manufacturer, "Lennox")
-      .setCharacteristic(Characteristic.Model, "S40")
-      .setCharacteristic(Characteristic.SerialNumber, String(this.zoneId ?? "S40-0"));
-  }
+    // Accessory info
+    this.accessory.getService(this.Service.AccessoryInformation)
+      .setCharacteristic(this.Characteristic.Manufacturer, "Lennox")
+      .setCharacteristic(this.Characteristic.Model, "S40")
+      .setCharacteristic(this.Characteristic.SerialNumber, `zone-${zoneId}`);
 
-  // ---------- Public: feed cloud/LAN status into HomeKit ----------
-  /**
-   * status sample (from LAN):
-   * {
-   *   temperatureC: 23, temperature: 73, humidity: 66,
-   *   tempOperation: "off"|"heating"|"cooling",
-   *   period: { systemMode: "heat and cool", hspC: 20.5, cspC: 23, ... }
-   * }
-   */
-  applyZoneStatus(status) {
-    const { Characteristic } = this.platform;
-
-    // Current temp (prefer °C, else convert from °F if provided)
-    const cC = this.pickNumber(
-      status?.temperatureC,
-      this.fromF(status?.temperature)
+    platform.api.registerPlatformAccessories(
+      "homebridge-lennox-s40",
+      "LennoxS40Platform",
+      [this.accessory]
     );
-    if (Number.isFinite(cC)) {
-      this.curTempC = cC;
-      this.thermo.updateCharacteristic(Characteristic.CurrentTemperature, this.curTempC);
-    }
-
-    // Current op -> CurrentHeatingCoolingState
-    if (typeof status?.tempOperation === "string") {
-      this.currentOperation = status.tempOperation;
-      this.thermo.updateCharacteristic(
-        Characteristic.CurrentHeatingCoolingState,
-        this.mapCurrentState(this.currentOperation)
-      );
-    }
-
-    // Target mode from period.systemMode
-    const maybeMode = status?.period?.systemMode;
-    if (typeof maybeMode === "string") {
-      this.targetMode = maybeMode;
-      this.thermo.updateCharacteristic(
-        Characteristic.TargetHeatingCoolingState,
-        MODE_TO_HOMEKIT[this.targetMode] ?? 0
-      );
-    }
-
-    // Setpoints (prefer °C, else convert from °F)
-    const hC = this.pickNumber(status?.period?.hspC, this.fromF(status?.period?.hsp));
-    const cC = this.pickNumber(status?.period?.cspC, this.fromF(status?.period?.csp));
-
-    if (Number.isFinite(hC)) {
-      this.hspC = this.clamp(hC, 0, 25);
-      this.thermo.updateCharacteristic(Characteristic.HeatingThresholdTemperature, this.hspC);
-    }
-    if (Number.isFinite(cC)) {
-      this.cspC = this.clamp(cC, 10, 35);
-      this.thermo.updateCharacteristic(Characteristic.CoolingThresholdTemperature, this.cspC);
-    }
-
-    // Humidity
-    if (Number.isFinite(status?.humidity)) {
-      this.humidity = status.humidity;
-      this.humidSvc.updateCharacteristic(Characteristic.CurrentRelativeHumidity, this.humidity);
-    }
   }
 
-  // ---------- Setters (HomeKit -> S40) ----------
-  async setMode(mode) {
+  _currentState() {
+    const C = this.Characteristic.CurrentHeatingCoolingState;
+    if (this.mode === "heat") return C.HEAT;
+    if (this.mode === "cool") return C.COOL;
+    // If "heat and cool", HomeKit Current state should still reflect *active* op,
+    // but without tempOperation we show OFF to avoid invalid value=3.
+    return C.OFF;
+  }
+
+  // Called with S40 status (temps in °F)
+  applyZoneStatus(s) {
+    if (!s) return;
+    const p = s.period || {};
+    this.log(`[Zone ${this.zoneId}] raw: temp=${s.temperature}°F, hsp=${p.hsp}°F, csp=${p.csp}°F, mode=${p.systemMode}`);
+
+    if (typeof s.temperature === "number") this.tempC = f2c(s.temperature);
+    else this.log.debug?.(`[Zone ${this.zoneId}] no temperature in packet; keeping last ${this.tempC ?? 'n/a'}°C`);
+    if (typeof s.humidity === "number") this.humidity = s.humidity;
+    if (typeof p.hsp === "number") this.hspC = f2c(p.hsp);
+    if (typeof p.csp === "number") this.cspC = f2c(p.csp);
+    if (typeof p.systemMode === "string") this.mode = p.systemMode;
+
+    this.haveFirstStatus = true;
+
+    const C = this.Characteristic;
+    const t = clamp(this.tempC, -40, 100);
+    const h = clamp(this.hspC, 10.0, 29.4);
+    const c = clamp(this.cspC, 15.5, 32.2);
+    this.log(`[Zone ${this.zoneId}] push HK: temp=${t.toFixed(1)}°C (${Math.round(c2f(t))}°F), hsp=${h.toFixed(1)}°C, csp=${c.toFixed(1)}°C, mode=${this.mode}`);
+
     try {
-      this.targetMode = mode;
-      await this.sendPeriod({ systemMode: mode });
-      // update cached Target on success
-      this.thermo.updateCharacteristic(
-        this.platform.Characteristic.TargetHeatingCoolingState,
-        MODE_TO_HOMEKIT[this.targetMode] ?? 0
-      );
+      this.service.updateCharacteristic(C.CurrentTemperature, t);
+      this.service.updateCharacteristic(C.TargetHeatingCoolingState, MODE_TO_HOMEKIT[this.mode] ?? 0);
+      this.service.updateCharacteristic(C.CoolingThresholdTemperature, c);
+      this.service.updateCharacteristic(C.HeatingThresholdTemperature, h);
+      const humidSvc = this.accessory.getService(this.Service.HumiditySensor);
+      if (humidSvc && Number.isFinite(this.humidity)) {
+        humidSvc.updateCharacteristic(C.CurrentRelativeHumidity, this.humidity);
+      }
+      this.log(`[Zone ${this.zoneId}] HK updated OK`);
     } catch (e) {
-      this.log.error("[Lennox Zone %s] setMode error: %s", this.zoneId, e?.message || e);
-      throw e;
+      this.log.error(`[Zone ${this.zoneId}] HK update failed: ${e?.message || e}`);
     }
-  }
-
-  async setHeatC(vC) {
-    try {
-      const clamped = this.clamp(vC, 0, 25);
-      await this.sendPeriod({ hspC: clamped });
-      this.hspC = clamped;
-      this.thermo.updateCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature, this.hspC);
-    } catch (e) {
-      this.log.error("[Lennox Zone %s] setHeatC error: %s", this.zoneId, e?.message || e);
-      throw e;
-    }
-  }
-
-  async setCoolC(vC) {
-    try {
-      const clamped = this.clamp(vC, 10, 35);
-      await this.sendPeriod({ cspC: clamped });
-      this.cspC = clamped;
-      this.thermo.updateCharacteristic(this.platform.Characteristic.CoolingThresholdTemperature, this.cspC);
-    } catch (e) {
-      this.log.error("[Lennox Zone %s] setCoolC error: %s", this.zoneId, e?.message || e);
-      throw e;
-    }
-  }
-
-  // ---------- Wire-up to your platform client ----------
-  async sendPeriod(partial) {
-    // S40 LAN write schema: zones -> [{ id, status: { period: {...} } }]
-    const body = {
-      zones: [
-        { id: this.zoneId, status: { period: { ...partial } } }
-      ]
-    };
-    if (!this.platform?.client?.command) {
-      throw new Error("platform.client.command not available");
-    }
-    this.platform.log.debug("[Lennox Zone %s] WRITE %j", this.zoneId, body);
-    await this.platform.client.command(body);
-  }
-
-  // ---------- Helpers ----------
-  mapCurrentState(tempOperation) {
-    const { Characteristic } = this.platform;
-    if (tempOperation === "heating") return Characteristic.CurrentHeatingCoolingState.HEAT;
-    if (tempOperation === "cooling") return Characteristic.CurrentHeatingCoolingState.COOL;
-    return Characteristic.CurrentHeatingCoolingState.OFF;
-  }
-
-  fromF(vF) {
-    return (typeof vF === "number") ? (vF - 32) * 5 / 9 : undefined;
-  }
-
-  clamp(val, min, max) {
-    if (!Number.isFinite(val)) return val;
-    if (min !== undefined && val < min) val = min;
-    if (max !== undefined && val > max) val = max;
-    return Math.round(val * 10) / 10; // keep a tidy single decimal
-  }
-
-  pickNumber(...candidates) {
-    for (const v of candidates) {
-      if (Number.isFinite(v)) return v;
-    }
-    return undefined;
   }
 }
 
-module.exports = LennoxZoneAccessory;
+module.exports = { LennoxZoneAccessory };

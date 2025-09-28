@@ -101,13 +101,28 @@ class LccClient {
     ]);
   }
 
-  async setZoneSetpoints(zoneId, { hsp, csp }) {
+  async setZoneSetpoints(zoneId, { hsp, csp, mode }) {
+    this.log.warn(`[client] setZoneSetpoints zone=${zoneId} body=${JSON.stringify(body)}`);
     const period = {};
     if (typeof hsp === "number") period.hsp = hsp;
     if (typeof csp === "number") period.csp = csp;
-    await this.publish("zones", [
-      { id: Number(zoneId), status: { period } }
-    ]);
+    if (typeof mode === "string") period.systemMode = mode;
+    // Lennox S40 usually requires a hold instruction
+    const payload = [
+     {
+       id: Number(zoneId),
+       status: {
+         period,
+         hold: { type: "permanent" }   // or "temporary" if you want a schedule hold
+       }
+     }
+   ];
+
+   this.log(`[client] setZoneSetpoints zone=${zoneId} payload=${JSON.stringify(payload)}`);
+
+    // Send it
+    await this.publish("zones", payload);
+    this.log.warn(`[client] response ${res.statusCode} ${res.body}`);
   }
 }
 
