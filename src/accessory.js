@@ -137,14 +137,12 @@ class LennoxZoneAccessory {
     this.service.getCharacteristic(this.Characteristic.HeatingThresholdTemperature)
       .onGet(() => this.fToC(this.currentHspF ?? 70))
       .onSet(async (cVal) => {
-        // Deadband-enforcing setter: if user raises HSP too close to CSP,
-        // bump CSP up to maintain >= 3°F gap and reflect it immediately in HK.
+        // Deadband-enforcing setter
         const newHspF = this.cToF(cVal);
         let newCspF = this.currentCspF ?? 73;
 
         if (Number.isFinite(newHspF) && Number.isFinite(newCspF) && (newCspF - newHspF) < 3) {
           newCspF = newHspF + 3;
-          // Move the *other* slider in the Home UI right away
           this.currentCspF = Math.round(newCspF);
           this.service.updateCharacteristic(
             this.Characteristic.CoolingThresholdTemperature,
@@ -159,14 +157,12 @@ class LennoxZoneAccessory {
     this.service.getCharacteristic(this.Characteristic.CoolingThresholdTemperature)
       .onGet(() => this.fToC(this.currentCspF ?? 73))
       .onSet(async (cVal) => {
-        // Deadband-enforcing setter: if user lowers CSP too close to HSP,
-        // pull HSP down to maintain >= 3°F gap and reflect it immediately in HK.
+        // Deadband-enforcing setter
         const newCspF = this.cToF(cVal);
         let newHspF = this.currentHspF ?? 70;
 
         if (Number.isFinite(newHspF) && Number.isFinite(newCspF) && (newCspF - newHspF) < 3) {
           newHspF = newCspF - 3;
-          // Move the *other* slider in the Home UI right away
           this.currentHspF = Math.round(newHspF);
           this.service.updateCharacteristic(
             this.Characteristic.HeatingThresholdTemperature,
@@ -202,12 +198,18 @@ class LennoxZoneAccessory {
       this.service.updateCharacteristic(this.Characteristic.CurrentRelativeHumidity, this.currentHumPct);
     }
 
-    // Period setpoints (F/C both appear)
+    // Period setpoints: prefer native °F, fall back to °C only if °F missing
     const p = status.period || {};
-    if (typeof p.hsp === "number") this.currentHspF = p.hsp;
-    if (typeof p.csp === "number") this.currentCspF = p.csp;
-    if (typeof p.hspC === "number") this.currentHspF = this.cToF(p.hspC);
-    if (typeof p.cspC === "number") this.currentCspF = this.cToF(p.cspC);
+    if (typeof p.hsp === "number") {
+      this.currentHspF = p.hsp;
+    } else if (typeof p.hspC === "number") {
+      this.currentHspF = this.cToF(p.hspC);
+    }
+    if (typeof p.csp === "number") {
+      this.currentCspF = p.csp;
+    } else if (typeof p.cspC === "number") {
+      this.currentCspF = this.cToF(p.cspC);
+    }
 
     // Reflect thresholds back to HK in °C
     if (typeof this.currentHspF === "number") {
