@@ -5,6 +5,7 @@
 // Adds a coalesced writer so rapid changes (and device echoes) don’t cause
 // back-to-back writes like: {"hsp":69,"csp":78} then {"hsp":67,"csp":78}.
 // Also reports CurrentRelativeHumidity from zones.status.humidity.
+// Now also restores/persists last-known state via accessory.context.
 //
 
 const UUID_NS = "lennox-s40-zone";
@@ -93,18 +94,55 @@ class LennoxZoneAccessory {
     this.service = this.accessory.getService(this.Service.Thermostat)
       || this.accessory.addService(this.Service.Thermostat, displayName);
 
-    // Initial mirrors / local cache
-    this.currentHKMode = this.Characteristic.TargetHeatingCoolingState.AUTO;
-    this.currentTempC = 21.0;
-    this.currentHspF = 70;
-    this.currentCspF = 73;
-    this.currentHumPct = 0;
+    // ---------- Cached context restore (pre-seed tile on boot) ----------
+    const ctx = this.accessory.context || {};
+    this.currentHKMode = (typeof ctx.currentHKMode === "number")
+      ? ctx.currentHKMode
+      : this.Characteristic.TargetHeatingCoolingState.AUTO;
 
-    // --- NEW: liveness tracking for HomeKit tile ---
-    this.isActive = true;
-    this.lastSeenAt = Date.now();
+    this.currentTempC = (typeof ctx.currentTempC === "number") ? ctx.currentTempC : 21.0;
+    this.currentHspF  = (typeof ctx.currentHspF  === "number") ? ctx.currentHspF  : 70;
+    this.currentCspF  = (typeof ctx.currentCspF  === "number") ? ctx.currentCspF  : 73;
+    this.currentHumPct = (typeof ctx.currentHumPct === "number") ? ctx.currentHumPct : 0;
 
-    // Expose StatusActive; Home uses this to decide “No Response”
+    // Liveness: default to active (keeps Home from showing “No Response” after restart)
+    this.isActive   = (typeof ctx.isActive === "boolean") ? ctx.isActive : true;
+    this.lastSeenAt = (typeof ctx.lastSeenAt === "number") ? ctx.lastSeenAt : Date.now();
+
+    // Immediately reflect cached values to HK so UI isn't stale on boot
+    try {
+      this.service.updateCharacteristic(this.Characteristic.StatusActive, this.isActive);
+      this.service.updateCharacteristic(this.Characteristic.CurrentTemperature, this.currentTempC);
+      this.service.updateCharacteristic(this.Characteristic.CurrentRelativeHumidity, this.currentHumPct);
+      this.service.updateCharacteristic(this.Characteristic.HeatingThresholdTemperature, this.fToC(this.currentHspF));
+      this.service.updateCharacteristic(this.Characteristic.CoolingThresholdTemperature, this.fToC(this.currentCspF));
+    } catch (_) {}
+    // --------------------------------------------------------------------
+
+    // Debounced context saver
+    this._ctxSaveTimer = undefined;
+    this._saveContextSoon = () => {
+      if (this._ctxSaveTimer) clearTimeout(this._ctxSaveTimer);
+      this._ctxSaveTimer = setTimeout(() => {
+        this.accessory.context = {
+          currentHKMode: this.currentHKMode,
+          currentTempC: this.currentTempC,
+          currentHspF: this.currentHspF,
+          currentCspF: this.currentCspF,
+          currentHumPct: this.currentHumPct,
+          isActive: this.isActive,
+          lastSeenAt: this.lastSeenAt
+        };
+        try {
+          // Persist to disk; Homebridge caches accessory.context
+          this.api.updatePlatformAccessories("homebridge-lennox-s40", "LennoxS40Platform", [this.accessory]);
+        } catch (e) {
+          this.log(`[Zone ${this.zoneId}] context save error: ${e.message}`);
+        }
+      }, 1000); // coalesce rapid updates
+    };
+
+    // --- Liveness tracking for HomeKit tile ---
     this.service.getCharacteristic(this.Characteristic.StatusActive)
       .onGet(() => this.isActive);
 
@@ -114,9 +152,9 @@ class LennoxZoneAccessory {
       if (active !== this.isActive) {
         this.isActive = active;
         this.service.updateCharacteristic(this.Characteristic.StatusActive, this.isActive);
+        this._saveContextSoon();
       }
     }, 30_000);
-    // -----------------------------------------------
 
     // Mute guard to prevent set<->onSet loops
     this._mutingHK = false;
@@ -139,6 +177,7 @@ class LennoxZoneAccessory {
       .onSet(async (newVal) => {
         if (this._mutingHK) return;
         this.currentHKMode = newVal;
+        this._saveContextSoon();
         this.log(`[Zone ${this.zoneId}] Target mode -> ${newVal} (mode write handled elsewhere if implemented)`);
       });
 
@@ -281,6 +320,9 @@ class LennoxZoneAccessory {
       this.service.updateCharacteristic(CHCS, next);
     }
 
+    // Persist updated context (debounced)
+    this._saveContextSoon();
+
     // Writer ACK
     this._writer.onDeviceEcho({ hspF: this.currentHspF, cspF: this.currentCspF });
   }
@@ -301,6 +343,9 @@ class LennoxZoneAccessory {
       this.service.updateCharacteristic(this.Characteristic.HeatingThresholdTemperature, this.fToC(this.currentHspF));
       this.service.updateCharacteristic(this.Characteristic.CoolingThresholdTemperature, this.fToC(this.currentCspF));
     });
+
+    // Persist soon
+    this._saveContextSoon();
 
     this._writer.requestWrite({ hspF: this.currentHspF, cspF: this.currentCspF });
   }
