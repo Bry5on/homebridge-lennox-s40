@@ -100,6 +100,24 @@ class LennoxZoneAccessory {
     this.currentCspF = 73;
     this.currentHumPct = 0;
 
+    // --- NEW: liveness tracking for HomeKit tile ---
+    this.isActive = true;
+    this.lastSeenAt = Date.now();
+
+    // Expose StatusActive; Home uses this to decide “No Response”
+    this.service.getCharacteristic(this.Characteristic.StatusActive)
+      .onGet(() => this.isActive);
+
+    // Watchdog: mark inactive if no zone data for 90s; check every 30s
+    this._aliveTimer = setInterval(() => {
+      const active = (Date.now() - this.lastSeenAt) < 90_000;
+      if (active !== this.isActive) {
+        this.isActive = active;
+        this.service.updateCharacteristic(this.Characteristic.StatusActive, this.isActive);
+      }
+    }, 30_000);
+    // -----------------------------------------------
+
     // Mute guard to prevent set<->onSet loops
     this._mutingHK = false;
     this._withHKMute = (fn) => { this._mutingHK = true; try { fn(); } finally { this._mutingHK = false; } };
@@ -182,6 +200,13 @@ class LennoxZoneAccessory {
   // Apply zone.status from the poller
   applyZoneStatus(status) {
     if (!status) return;
+
+    // Liveness tick
+    this.lastSeenAt = Date.now();
+    if (!this.isActive) {
+      this.isActive = true;
+      this.service.updateCharacteristic(this.Characteristic.StatusActive, true);
+    }
 
     // Temperature
     if (typeof status.temperatureC === "number") {
