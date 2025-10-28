@@ -46,18 +46,18 @@ class LennoxS40Platform {
     this.holdScheduleId = new Map();
     for (const zid of this.zoneIds) this.holdScheduleId.set(zid, 32 + zid);
 
+    // === NEW: remember cached accessories Homebridge restores on boot ===
+    this.cachedAccessories = new Map(); // UUID -> accessory
+
     api.on("didFinishLaunching", async () => {
       try {
+        // === NEW: adopt/prune before we start talking to the S40 ===
+        this.adoptOrCreateAccessories();
+        this.pruneStaleAccessories();
+
         await this.client.connect();
         await this.client.connectEndpoint();
         await this.client.requestData(["/devices", "/equipments", "/zones"]);
-
-        for (const zoneId of this.zoneIds) {
-          if (!this.zoneAccessories.has(zoneId)) {
-            const acc = new LennoxZoneAccessory(this, zoneId);
-            this.zoneAccessories.set(zoneId, acc);
-          }
-        }
 
         this.startPump();
       } catch (e) {
@@ -66,8 +66,69 @@ class LennoxS40Platform {
     });
   }
 
-  configureAccessory() {
-    // Fresh registration each launch; HB caches them.
+  // === NEW: Homebridge calls this with each cached accessory on boot
+  configureAccessory(accessory) {
+    this.cachedAccessories.set(accessory.UUID, accessory);
+  }
+
+  // === NEW: consistent UUID builder (must match accessory.js UUID_NS)
+  zoneUuid(zoneId) {
+    return this.api.hap.uuid.generate(`lennox-s40-zone:${zoneId}`);
+  }
+
+  // === NEW: create or adopt one accessory per configured zone
+  adoptOrCreateAccessories() {
+    const toRegister = [];
+    for (const zoneId of this.zoneIds) {
+      const uuid = this.zoneUuid(zoneId);
+      const cached = this.cachedAccessories.get(uuid);
+
+      if (cached) {
+        // Adopt cached
+        this.log(`[LennoxS40] adopting cached accessory for zone ${zoneId}`);
+        const acc = new LennoxZoneAccessory(this, zoneId);  // creates a new "wrapper"
+        // Use the cached platformAccessory instead of creating a new one:
+        acc.accessory = cached;
+        acc.service =
+          cached.getService(this.Service.Thermostat) ||
+          cached.addService(this.Service.Thermostat, `Lennox S40 Zone ${zoneId}`);
+        this.zoneAccessories.set(zoneId, acc);
+      } else {
+        // Create new
+        const acc = new LennoxZoneAccessory(this, zoneId);
+        this.zoneAccessories.set(zoneId, acc);
+        toRegister.push(acc.accessory);
+      }
+    }
+
+    if (toRegister.length) {
+      this.api.registerPlatformAccessories(
+        "homebridge-lennox-s40",
+        "LennoxS40Platform",
+        toRegister
+      );
+    }
+  }
+
+  // === NEW: unregister anything cached that we don't manage now
+  pruneStaleAccessories() {
+    const wanted = new Set(this.zoneIds.map((zid) => this.zoneUuid(zid)));
+    const toUnregister = [];
+
+    for (const [uuid, acc] of this.cachedAccessories.entries()) {
+      if (!wanted.has(uuid)) {
+        toUnregister.push(acc);
+      }
+    }
+
+    if (toUnregister.length) {
+      this.log(`[LennoxS40] pruning ${toUnregister.length} stale cached accessory(ies)`);
+      this.api.unregisterPlatformAccessories(
+        "homebridge-lennox-s40",
+        "LennoxS40Platform",
+        toUnregister
+      );
+    }
   }
 
   // Central helper used by accessories to write setpoints
@@ -84,18 +145,9 @@ class LennoxS40Platform {
     this.log(`[LennoxS40] zone=${zoneId} scheduleId=${sid} periodId=0 write -> ${JSON.stringify(period)}`);
     await this.client.setSchedulePeriod(sid, 0, period);
 
-    // tiny pause so S40 snapshots period before arming hold
     await new Promise((r) => setTimeout(r, 150));
 
     // (2) Arm a temp hold that points at that schedule — try multiple ways
-    const desiredHold = {
-      type: "temporary",
-      expirationMode: "nextPeriod",
-      scheduleId: sid,
-      period, // some firmwares like the temps echoed here
-    };
-
-    // Try zones/config/scheduleHold.enabled=true
     let holdArmed = false;
     if (typeof this.client.setZoneConfigScheduleHold === "function") {
       try {
@@ -113,7 +165,6 @@ class LennoxS40Platform {
       }
     }
 
-    // Fallback: zones/command/setScheduleHold
     if (!holdArmed && typeof this.client.setScheduleHold === "function") {
       try {
         await this.client.setScheduleHold(zoneId, sid, {
@@ -129,7 +180,6 @@ class LennoxS40Platform {
       }
     }
 
-    // Last resort: zones/status/hold
     if (!holdArmed && typeof this.client.setZoneHoldStatus === "function") {
       try {
         await this.client.setZoneHoldStatus(zoneId, {
@@ -143,7 +193,6 @@ class LennoxS40Platform {
       }
     }
 
-    // Nudge for immediate UI refresh
     try { await this.client.requestData(["/zones"]); } catch {}
 
     if (!holdArmed) {
