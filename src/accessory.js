@@ -90,20 +90,12 @@ class LennoxZoneAccessory {
     const displayName = `Lennox S40 Zone ${zoneId}`;
 
     this.accessory = new this.api.platformAccessory(displayName, uuid);
+    this.accessory.context.zoneId = this.zoneId; // NEW: for prune/adopt matching
     this.service = this.accessory.getService(this.Service.Thermostat)
       || this.accessory.addService(this.Service.Thermostat, displayName);
 
-    // --- NEW: normalize AccessoryInformation on every boot ---
-    {
-      const info = this.accessory.getService(this.Service.AccessoryInformation)
-        || this.accessory.addService(this.Service.AccessoryInformation);
-      info
-        .setCharacteristic(this.Characteristic.Manufacturer, "Lennox")
-        .setCharacteristic(this.Characteristic.Model, "S40 Thermostat")
-        .setCharacteristic(this.Characteristic.SerialNumber, `zone-${zoneId}`)
-        .setCharacteristic(this.Characteristic.FirmwareRevision, "0.0.0");
-    }
-    // ---------------------------------------------------------
+    // AccessoryInformation + firmware nudge
+    this.ensureInfo();
 
     // Initial mirrors / local cache
     this.currentHKMode = this.Characteristic.TargetHeatingCoolingState.AUTO;
@@ -116,9 +108,11 @@ class LennoxZoneAccessory {
     this.isActive = true;
     this.lastSeenAt = Date.now();
 
+    // Expose StatusActive; Home uses this to decide “No Response”
     this.service.getCharacteristic(this.Characteristic.StatusActive)
       .onGet(() => this.isActive);
 
+    // Watchdog: mark inactive if no zone data for 90s; check every 30s
     this._aliveTimer = setInterval(() => {
       const active = (Date.now() - this.lastSeenAt) < 90_000;
       if (active !== this.isActive) {
@@ -126,10 +120,6 @@ class LennoxZoneAccessory {
         this.service.updateCharacteristic(this.Characteristic.StatusActive, this.isActive);
       }
     }, 30_000);
-
-    // Clear watchdog on shutdown
-    if (this.api.on) this.api.on('shutdown', () => clearInterval(this._aliveTimer));
-    // -----------------------------------------
 
     // Mute guard to prevent set<->onSet loops
     this._mutingHK = false;
@@ -206,8 +196,16 @@ class LennoxZoneAccessory {
       })
       .setProps({ minValue: 15.5, maxValue: 37, minStep: 0.5 });
 
-    // Register with HB (moved to index.js)
-    //this.api.registerPlatformAccessories("homebridge-lennox-s40", "LennoxS40Platform", [this.accessory]);
+    // Register with HB
+    this.api.registerPlatformAccessories("homebridge-lennox-s40", "LennoxS40Platform", [this.accessory]);
+
+    // >>> NEW: persist identity/firmware into HB cache immediately <<<
+    this.flushInfoToCache();
+
+    // Re-assert firmware a couple times in case an exporter scraped early
+    setTimeout(() => this.ensureInfo(true), 1500);
+    setTimeout(() => this.ensureInfo(true), 10_000);
+    // <<< END NEW >>>
   }
 
   // Apply zone.status from the poller
@@ -316,6 +314,45 @@ class LennoxZoneAccessory {
     });
 
     this._writer.requestWrite({ hspF: this.currentHspF, cspF: this.currentCspF });
+  }
+
+  // --- NEW: AccessoryInformation setup + reassert path ---
+  ensureInfo(reassert = false) {
+    const info = this.accessory.getService(this.Service.AccessoryInformation)
+      || this.accessory.addService(this.Service.AccessoryInformation);
+
+    // Prefer plugin version if platform exposes it; otherwise lock to 0.0.0
+    const realFw = (this.platform && this.platform.pluginVersion) || "0.0.0";
+
+    info
+      .setCharacteristic(this.Characteristic.Manufacturer, "Lennox")
+      .setCharacteristic(this.Characteristic.Model, "S40 Thermostat")
+      .setCharacteristic(this.Characteristic.SerialNumber, `zone-${this.zoneId}`);
+
+    const FW = this.Characteristic.FirmwareRevision;
+    const current = info.getCharacteristic(FW).value;
+
+    // Force a visible change if exporter latched "0"
+    if (!reassert && (current === undefined || current === null || current === "0" || current === 0)) {
+      info.updateCharacteristic(FW, `${realFw}+boot`);
+    }
+
+    info.updateCharacteristic(FW, realFw);
+  }
+
+  // --- NEW: persist identity + firmware into HB cache (helps exporters that read context) ---
+  flushInfoToCache() {
+    const ctx = this.accessory.context || (this.accessory.context = {});
+    ctx.manufacturer = "Lennox";
+    ctx.model = "S40 Thermostat";
+    ctx.serialNumber = `zone-${this.zoneId}`;
+    ctx.firmwareRevision = (this.platform && this.platform.pluginVersion) || "0.0.0";
+    try {
+      this.api.updatePlatformAccessories([this.accessory]);
+      this.log(`[Zone ${this.zoneId}] AccessoryInformation persisted (fw=${ctx.firmwareRevision})`);
+    } catch (e) {
+      this.log(`[Zone ${this.zoneId}] updatePlatformAccessories failed: ${e.message}`);
+    }
   }
 
   fToC(f) { return Math.round(((f - 32) * 5) / 9 * 2) / 2; } // round to 0.5C
