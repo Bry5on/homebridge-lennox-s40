@@ -1,8 +1,11 @@
 {
   "name": "homebridge-lennox-s40",
-  "version": "0.1.0",
+  "displayName": "Lennox S40",
+  "version": "0.2.0",
   "description": "Homebridge plugin for Lennox S40 over local LAN (LCC endpoints).",
   "main": "src/index.js",
+  "author": "Bry5on",
+  "license": "MIT",
   "keywords": ["homebridge-plugin", "lennox", "s40", "thermostat"],
   "engines": {
     "node": ">=18.0.0",
@@ -11,7 +14,6 @@
   "dependencies": {
     "axios": "^1.7.9"
   },
-  "devDependencies": {},
   "homebridge": {
     "schema": "config.schema.json",
     "platforms": [
@@ -19,6 +21,5 @@
         "platform": "LennoxS40Platform"
       }
     ]
-  },
-  "license": "MIT"
+  }
 }
