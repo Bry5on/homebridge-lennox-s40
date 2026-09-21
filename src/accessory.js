@@ -1,5 +1,6 @@
 // Keep this string identical forever. Changing it mints a new HomeKit UUID.
 const UUID_NS = "lennox-s40-zone";
+const MIN_DEADBAND_F = 3;
 
 function zoneUuid(api, zoneId) {
   return api.hap.uuid.generate(`${UUID_NS}:${zoneId}`);
@@ -158,19 +159,7 @@ class LennoxZoneAccessory {
       .onGet(() => this.fToC(this.currentHspF ?? 70))
       .onSet(async (cVal) => {
         if (this._mutingHK) return;
-        const newHspF = this.cToF(cVal);
-        let newCspF = this.currentCspF ?? 73;
-        if (Number.isFinite(newHspF) && Number.isFinite(newCspF) && newCspF - newHspF < 3) {
-          newCspF = newHspF + 3;
-          this.currentCspF = Math.round(newCspF);
-          this._withHKMute(() => {
-            this.service.updateCharacteristic(
-              this.Characteristic.CoolingThresholdTemperature,
-              this.fToC(this.currentCspF)
-            );
-          });
-        }
-        await this.pushSetpoints(newHspF, newCspF);
+        await this.applyUserSetpoint("heat", this.cToF(cVal));
       })
       .setProps({ minValue: 4.5, maxValue: 32, minStep: 0.5 });
 
@@ -179,19 +168,7 @@ class LennoxZoneAccessory {
       .onGet(() => this.fToC(this.currentCspF ?? 73))
       .onSet(async (cVal) => {
         if (this._mutingHK) return;
-        const newCspF = this.cToF(cVal);
-        let newHspF = this.currentHspF ?? 70;
-        if (Number.isFinite(newHspF) && Number.isFinite(newCspF) && newCspF - newHspF < 3) {
-          newHspF = newCspF - 3;
-          this.currentHspF = Math.round(newHspF);
-          this._withHKMute(() => {
-            this.service.updateCharacteristic(
-              this.Characteristic.HeatingThresholdTemperature,
-              this.fToC(this.currentHspF)
-            );
-          });
-        }
-        await this.pushSetpoints(newHspF, newCspF);
+        await this.applyUserSetpoint("cool", this.cToF(cVal));
       })
       .setProps({ minValue: 15.5, maxValue: 37, minStep: 0.5 });
 
@@ -225,6 +202,37 @@ class LennoxZoneAccessory {
     this.accessory.context.model = "S40";
     this.accessory.context.serialNumber = String(this.zoneId);
     this.accessory.context.firmwareRevision = version;
+  }
+
+  // pinned = which limit the user just set. That value is kept; the other side moves.
+  applyDeadband(hspF, cspF, pinned) {
+    let hsp = Math.round(hspF);
+    let csp = Math.round(cspF);
+    if (!Number.isFinite(hsp) || !Number.isFinite(csp)) return { hspF: hsp, cspF: csp };
+
+    if (csp - hsp >= MIN_DEADBAND_F) return { hspF: hsp, cspF: csp };
+
+    if (pinned === "heat") {
+      csp = hsp + MIN_DEADBAND_F;
+    } else {
+      hsp = csp - MIN_DEADBAND_F;
+    }
+    return { hspF: hsp, cspF: csp };
+  }
+
+  async applyUserSetpoint(pinned, valueF) {
+    const next =
+      pinned === "heat"
+        ? this.applyDeadband(valueF, this.currentCspF ?? 73, "heat")
+        : this.applyDeadband(this.currentHspF ?? 70, valueF, "cool");
+
+    if (next.hspF !== Math.round(this.currentHspF) || next.cspF !== Math.round(this.currentCspF)) {
+      this.log(
+        `[${this.displayName}] deadband pin=${pinned} -> hsp=${next.hspF} csp=${next.cspF}`
+      );
+    }
+
+    await this.pushSetpoints(next.hspF, next.cspF);
   }
 
   applyZoneStatus(status) {
@@ -299,11 +307,6 @@ class LennoxZoneAccessory {
   }
 
   async pushSetpoints(hspF, cspF) {
-    if (Number.isFinite(hspF) && Number.isFinite(cspF) && cspF - hspF < 3) {
-      this.log(`[${this.displayName}] widening deadband: hsp=${hspF} csp=${cspF} -> ${hspF + 3}`);
-      cspF = hspF + 3;
-    }
-
     this.currentHspF = Math.round(hspF);
     this.currentCspF = Math.round(cspF);
 
