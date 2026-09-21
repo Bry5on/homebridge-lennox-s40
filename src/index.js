@@ -1,5 +1,5 @@
 const { LccClient } = require("./lccClient");
-const { LennoxZoneAccessory } = require("./accessory");
+const { LennoxZoneAccessory, zoneUuid } = require("./accessory");
 const pkg = require("../package.json");
 
 const PLUGIN_NAME = "homebridge-lennox-s40";
@@ -24,7 +24,7 @@ class LennoxS40Platform {
     this.verifyTLS = !!this.config.verifyTLS;
     this.longPollSeconds = Number(this.config.longPollSeconds || 15);
     this.logBodies = !!this.config.logBodies;
-    this.resetOnBoot = this.config.resetOnBoot !== false;
+    this.resetOnBoot = this.config.resetOnBoot === true;
 
     if (!this.host) {
       this.log.error("[Lennox S40] No host configured.");
@@ -49,7 +49,7 @@ class LennoxS40Platform {
       try {
         if (this.resetOnBoot && this.cachedByUUID.size > 0) {
           const stale = Array.from(this.cachedByUUID.values());
-          this.log(`[Lennox S40] resetOnBoot: removing ${stale.length} cached accessory(ies).`);
+          this.log.warn(`[Lennox S40] resetOnBoot: removing ${stale.length} cached accessory(ies); Grafana/HomeKit IDs will change.`);
           try {
             this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale);
           } catch (e) {
@@ -64,11 +64,27 @@ class LennoxS40Platform {
         await this.client.requestData(["/devices", "/equipments", "/zones"]);
 
         const multi = this.zoneIds.length > 1;
+        const keep = new Set();
+
         for (const zoneId of this.zoneIds) {
-          if (!this.zoneAccessories.has(zoneId)) {
-            const name = multi ? `${this.displayName} Zone ${zoneId}` : this.displayName;
-            const acc = new LennoxZoneAccessory(this, zoneId, name);
-            this.zoneAccessories.set(zoneId, acc);
+          const uuid = zoneUuid(this.api, zoneId);
+          keep.add(uuid);
+          const cached = this.cachedByUUID.get(uuid);
+          const name = multi ? `${this.displayName} Zone ${zoneId}` : this.displayName;
+          const acc = new LennoxZoneAccessory(this, zoneId, name, cached || null);
+          this.zoneAccessories.set(zoneId, acc);
+        }
+
+        const extras = [];
+        for (const [uuid, acc] of this.cachedByUUID) {
+          if (!keep.has(uuid)) extras.push(acc);
+        }
+        if (extras.length) {
+          this.log(`[Lennox S40] unregistering ${extras.length} accessory(ies) no longer in zoneIds`);
+          try {
+            this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, extras);
+          } catch (e) {
+            this.log.warn(`[Lennox S40] extra prune error: ${e.message}`);
           }
         }
 

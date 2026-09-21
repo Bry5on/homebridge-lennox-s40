@@ -1,7 +1,7 @@
 {
   "name": "homebridge-lennox-s40",
   "displayName": "Lennox S40",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Homebridge plugin for Lennox S40 over local LAN (LCC endpoints).",
   "main": "src/index.js",
   "author": "Bry5on",

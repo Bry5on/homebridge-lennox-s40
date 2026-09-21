@@ -1,4 +1,9 @@
-const UUID_NS = "homebridge-lennox-s40:zone";
+// Keep this string identical forever. Changing it mints a new HomeKit UUID.
+const UUID_NS = "lennox-s40-zone";
+
+function zoneUuid(api, zoneId) {
+  return api.hap.uuid.generate(`${UUID_NS}:${zoneId}`);
+}
 
 class CoalescedSetpointWriter {
   constructor(log, publishSetpoints, debounceMs = 350) {
@@ -64,23 +69,30 @@ class CoalescedSetpointWriter {
 }
 
 class LennoxZoneAccessory {
-  constructor(platform, zoneId, displayName) {
+  constructor(platform, zoneId, displayName, existingAccessory) {
     this.platform = platform;
     this.api = platform.api;
     this.log = platform.log;
     this.Service = platform.Service;
     this.Characteristic = platform.Characteristic;
     this.zoneId = zoneId;
-    this.displayName = displayName || platform.displayName || "Lennox S40";
 
-    const uuid = this.api.hap.uuid.generate(`${UUID_NS}:${zoneId}`);
-    this.accessory = new this.api.platformAccessory(this.displayName, uuid);
-    this.accessory.context.zoneId = this.zoneId;
+    const uuid = zoneUuid(this.api, zoneId);
+    const adopted = !!existingAccessory;
+
+    if (existingAccessory) {
+      this.accessory = existingAccessory;
+      this.accessory.context.zoneId = this.zoneId;
+      this.displayName = existingAccessory.displayName || displayName;
+    } else {
+      this.displayName = displayName || platform.displayName || "Lennox S40";
+      this.accessory = new this.api.platformAccessory(this.displayName, uuid);
+      this.accessory.context.zoneId = this.zoneId;
+    }
 
     this.service =
       this.accessory.getService(this.Service.Thermostat) ||
       this.accessory.addService(this.Service.Thermostat, this.displayName);
-    this.service.setCharacteristic(this.Characteristic.Name, this.displayName);
 
     this.setAccessoryInfo();
 
@@ -183,11 +195,16 @@ class LennoxZoneAccessory {
       })
       .setProps({ minValue: 15.5, maxValue: 37, minStep: 0.5 });
 
-    this.api.registerPlatformAccessories(
-      this.platform.pluginName,
-      this.platform.platformName,
-      [this.accessory]
-    );
+    if (adopted) {
+      this.log(`[${this.displayName}] adopted cached accessory zone=${this.zoneId}`);
+    } else {
+      this.api.registerPlatformAccessories(
+        this.platform.pluginName,
+        this.platform.platformName,
+        [this.accessory]
+      );
+      this.log(`[${this.displayName}] registered new accessory zone=${this.zoneId}`);
+    }
   }
 
   setAccessoryInfo() {
@@ -195,7 +212,7 @@ class LennoxZoneAccessory {
       this.accessory.getService(this.Service.AccessoryInformation) ||
       this.accessory.addService(this.Service.AccessoryInformation);
 
-    const version = this.platform.pluginVersion || "0.2.0";
+    const version = this.platform.pluginVersion || "0.2.1";
 
     info
       .setCharacteristic(this.Characteristic.Manufacturer, "Lennox")
@@ -203,6 +220,7 @@ class LennoxZoneAccessory {
       .setCharacteristic(this.Characteristic.SerialNumber, String(this.zoneId))
       .setCharacteristic(this.Characteristic.FirmwareRevision, version);
 
+    this.accessory.context.zoneId = this.zoneId;
     this.accessory.context.manufacturer = "Lennox";
     this.accessory.context.model = "S40";
     this.accessory.context.serialNumber = String(this.zoneId);
@@ -306,4 +324,4 @@ class LennoxZoneAccessory {
   }
 }
 
-module.exports = { LennoxZoneAccessory };
+module.exports = { LennoxZoneAccessory, zoneUuid };

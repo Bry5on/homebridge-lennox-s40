@@ -42,7 +42,8 @@
       "resetOnBoot": {
         "type": "boolean",
         "title": "Reset cached accessories on boot",
-        "default": true
+        "description": "Leave off. Turning this on creates new HomeKit/Grafana identities after every restart.",
+        "default": false
       },
       "logBodies": {
         "type": "boolean",
