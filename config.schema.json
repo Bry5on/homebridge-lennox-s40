@@ -2,6 +2,7 @@
   "pluginAlias": "LennoxS40Platform",
   "pluginType": "platform",
   "singular": true,
+  "headerDisplay": "Lennox S40 over local LCC. A Home mode change switches that zone onto manual schedule 16+zoneId (same path as lennoxs30api) and does not return it to the programmed schedule. Child bridge is config-only: Bridge Settings, then pair the child QR and delete the old tile.",
   "schema": {
     "type": "object",
     "properties": {
