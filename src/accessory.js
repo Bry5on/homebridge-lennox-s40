@@ -1,6 +1,10 @@
 // Keep this string identical forever. Changing it mints a new HomeKit UUID.
 const UUID_NS = "lennox-s40-zone";
 const MIN_DEADBAND_F = 3;
+const MODE_HOLD_MS = 12_000;
+
+const HK_TO_LENNOX = { 0: "off", 1: "heat", 2: "cool", 3: "heat and cool" };
+const LENNOX_TO_HK = { off: 0, heat: 1, cool: 2, "heat and cool": 3, "emergency heat": 1 };
 
 function zoneUuid(api, zoneId) {
   return api.hap.uuid.generate(`${UUID_NS}:${zoneId}`);
@@ -64,8 +68,15 @@ class CoalescedSetpointWriter {
     this.pending = null;
     this.inFlight = { ...toSend };
     this.log("publish setpoints hsp=%d csp=%d", toSend.hspF, toSend.cspF);
-    await this.publishSetpoints(toSend);
-    this.lastPublished = { ...toSend };
+    try {
+      await this.publishSetpoints(toSend);
+      this.lastPublished = { ...toSend };
+      this.inFlight = null;
+    } catch (err) {
+      this.inFlight = null;
+      this.pending = this.pending || toSend;
+      throw err;
+    }
   }
 }
 
@@ -105,6 +116,7 @@ class LennoxZoneAccessory {
     this.isActive = true;
     this.lastSeenAt = Date.now();
     this.lastHKState = this.Characteristic.CurrentHeatingCoolingState.OFF;
+    this._modeHoldUntil = 0;
 
     this.service.getCharacteristic(this.Characteristic.StatusActive).onGet(() => this.isActive);
 
@@ -137,12 +149,21 @@ class LennoxZoneAccessory {
       350
     );
 
+    const THCS = this.Characteristic.TargetHeatingCoolingState;
     this.service
-      .getCharacteristic(this.Characteristic.TargetHeatingCoolingState)
-      .onGet(() => this.currentHKMode ?? this.Characteristic.TargetHeatingCoolingState.AUTO)
+      .getCharacteristic(THCS)
+      .onGet(() => this.currentHKMode ?? THCS.AUTO)
       .onSet(async (newVal) => {
         if (this._mutingHK) return;
-        this.currentHKMode = newVal;
+        const lennox = HK_TO_LENNOX[Number(newVal)];
+        if (!lennox) {
+          this.log.warn(`[${this.displayName}] unsupported HK mode ${newVal}`);
+          throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.INVALID_VALUE_IN_REQUEST);
+        }
+        this.currentHKMode = Number(newVal);
+        this._modeHoldUntil = Date.now() + MODE_HOLD_MS;
+        this.log(`[${this.displayName}] Target mode HK=${newVal} -> ${lennox}`);
+        await this.platform.setZoneHvacMode(this.zoneId, lennox);
       });
 
     this.service
@@ -189,7 +210,7 @@ class LennoxZoneAccessory {
       this.accessory.getService(this.Service.AccessoryInformation) ||
       this.accessory.addService(this.Service.AccessoryInformation);
 
-    const version = this.platform.pluginVersion || "0.2.1";
+    const version = this.platform.pluginVersion || "0.3.0";
 
     info
       .setCharacteristic(this.Characteristic.Manufacturer, "Lennox")
@@ -204,7 +225,6 @@ class LennoxZoneAccessory {
     this.accessory.context.firmwareRevision = version;
   }
 
-  // pinned = which limit the user just set. That value is kept; the other side moves.
   applyDeadband(hspF, cspF, pinned) {
     let hsp = Math.round(hspF);
     let csp = Math.round(cspF);
@@ -235,7 +255,7 @@ class LennoxZoneAccessory {
     await this.pushSetpoints(next.hspF, next.cspF);
   }
 
-  applyZoneStatus(status) {
+  applyZoneStatus(status, config) {
     if (!status) return;
 
     this.lastSeenAt = Date.now();
@@ -277,6 +297,20 @@ class LennoxZoneAccessory {
         );
       }
     });
+
+    const rawMode = (status.systemMode || p.systemMode || (config && config.systemMode) || "")
+      .toString()
+      .toLowerCase();
+    if (rawMode && Object.prototype.hasOwnProperty.call(LENNOX_TO_HK, rawMode)) {
+      const hk = LENNOX_TO_HK[rawMode];
+      const holding = Date.now() < this._modeHoldUntil && hk !== this.currentHKMode;
+      if (!holding && hk !== this.currentHKMode) {
+        this.currentHKMode = hk;
+        this._withHKMute(() => {
+          this.service.updateCharacteristic(this.Characteristic.TargetHeatingCoolingState, hk);
+        });
+      }
+    }
 
     const CHCS = this.Characteristic.CurrentHeatingCoolingState;
     const rawOp = (status.tempOperation || status.op || "").toString().toLowerCase();
