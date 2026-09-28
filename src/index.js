@@ -4,6 +4,7 @@ const pkg = require("../package.json");
 
 const PLUGIN_NAME = "homebridge-lennox-s40";
 const PLATFORM_NAME = "LennoxS40Platform";
+const LENNOX_HVAC = new Set(["off", "heat", "cool", "heat and cool"]);
 
 class LennoxS40Platform {
   constructor(log, config, api) {
@@ -43,7 +44,12 @@ class LennoxS40Platform {
     this.cachedByUUID = new Map();
     this.zoneAccessories = new Map();
     this.holdScheduleId = new Map();
+    this.zoneScheduleId = new Map();
     for (const zid of this.zoneIds) this.holdScheduleId.set(zid, 32 + zid);
+
+    this._pumpRunning = false;
+    this._retrieveStartTime = 1;
+    this._cursorAdvanced = false;
 
     api.on("didFinishLaunching", async () => {
       try {
@@ -59,35 +65,12 @@ class LennoxS40Platform {
           await new Promise((r) => setTimeout(r, 200));
         }
 
-        await this.client.connect();
-        await this.client.connectEndpoint();
-        await this.client.requestData(["/devices", "/equipments", "/zones"]);
-
-        const multi = this.zoneIds.length > 1;
-        const keep = new Set();
-
-        for (const zoneId of this.zoneIds) {
-          const uuid = zoneUuid(this.api, zoneId);
-          keep.add(uuid);
-          const cached = this.cachedByUUID.get(uuid);
-          const name = multi ? `${this.displayName} Zone ${zoneId}` : this.displayName;
-          const acc = new LennoxZoneAccessory(this, zoneId, name, cached || null);
-          this.zoneAccessories.set(zoneId, acc);
+        this.adoptZones();
+        try {
+          await this.sessionStart(true);
+        } catch (e) {
+          this.log.warn(`[Lennox S40] Initial session failed: ${e.message}`);
         }
-
-        const extras = [];
-        for (const [uuid, acc] of this.cachedByUUID) {
-          if (!keep.has(uuid)) extras.push(acc);
-        }
-        if (extras.length) {
-          this.log(`[Lennox S40] unregistering ${extras.length} accessory(ies) no longer in zoneIds`);
-          try {
-            this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, extras);
-          } catch (e) {
-            this.log.warn(`[Lennox S40] extra prune error: ${e.message}`);
-          }
-        }
-
         this.startPump();
       } catch (e) {
         this.log.error(`[Lennox S40] Startup failed: ${e.message}`);
@@ -97,6 +80,74 @@ class LennoxS40Platform {
 
   configureAccessory(accessory) {
     this.cachedByUUID.set(accessory.UUID, accessory);
+  }
+
+  adoptZones() {
+    const multi = this.zoneIds.length > 1;
+    const keep = new Set();
+
+    for (const zoneId of this.zoneIds) {
+      const uuid = zoneUuid(this.api, zoneId);
+      keep.add(uuid);
+      const cached = this.cachedByUUID.get(uuid);
+      const name = multi ? `${this.displayName} Zone ${zoneId}` : this.displayName;
+      const acc = new LennoxZoneAccessory(this, zoneId, name, cached || null);
+      this.zoneAccessories.set(zoneId, acc);
+    }
+
+    const extras = [];
+    for (const [uuid, acc] of this.cachedByUUID) {
+      if (!keep.has(uuid)) extras.push(acc);
+    }
+    if (extras.length) {
+      this.log(`[Lennox S40] unregistering ${extras.length} accessory(ies) no longer in zoneIds`);
+      try {
+        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, extras);
+      } catch (e) {
+        this.log.warn(`[Lennox S40] extra prune error: ${e.message}`);
+      }
+    }
+  }
+
+  manualScheduleId(zoneId) {
+    return 16 + Number(zoneId);
+  }
+
+  async sessionStart(resetCursor) {
+    await this.client.connect();
+    await this.client.connectEndpoint();
+    await this.client.requestData(["/devices", "/equipments", "/zones"]);
+    if (resetCursor) {
+      this._retrieveStartTime = 1;
+      this._cursorAdvanced = false;
+    }
+  }
+
+  async setZoneHvacMode(zoneId, lennoxMode) {
+    if (!LENNOX_HVAC.has(lennoxMode)) throw new Error(`unsupported HVAC mode: ${lennoxMode}`);
+    const manual = this.manualScheduleId(zoneId);
+    const current = this.zoneScheduleId.get(zoneId);
+
+    if (current !== manual) {
+      this.log(`[Lennox S40] zone=${zoneId} leaving schedule ${current ?? "unknown"} for manual ${manual} to set ${lennoxMode}`);
+      await this.client.setZoneSchedule(zoneId, manual);
+      this.zoneScheduleId.set(zoneId, manual);
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
+    this.log(`[Lennox S40] zone=${zoneId} systemMode -> ${lennoxMode} scheduleId=${manual}`);
+    await this.client.setSchedulePeriod(manual, 0, { systemMode: lennoxMode });
+
+    const hold = this.holdScheduleId.get(zoneId);
+    if (typeof hold === "number" && hold !== manual) {
+      try {
+        await this.client.setSchedulePeriod(hold, 0, { systemMode: lennoxMode });
+      } catch (e) {
+        this.log.warn(`[Lennox S40] zone=${zoneId} hold schedule mode write failed: ${e.message}`);
+      }
+    }
+
+    try { await this.client.requestData(["/zones"]); } catch {}
   }
 
   async setZoneSetpointsViaSchedule(zoneId, { hsp, csp }) {
@@ -157,39 +208,66 @@ class LennoxS40Platform {
     if (!holdArmed) this.log.warn("[Lennox S40] Hold may not be armed.");
   }
 
+  applyMessages(msgs) {
+    for (const m of msgs) {
+      if (!m) continue;
+      const data = m.Data || m.data;
+      if (!data || !Array.isArray(data.zones)) continue;
+
+      for (const z of data.zones) {
+        const zoneId = typeof z.id === "number" ? z.id : undefined;
+        if (zoneId == null) continue;
+
+        if (z.config && typeof z.config.scheduleId === "number") {
+          this.zoneScheduleId.set(zoneId, z.config.scheduleId);
+        }
+
+        const schedHold = z.config && z.config.scheduleHold;
+        if (schedHold && typeof schedHold.scheduleId === "number") {
+          const existing = this.holdScheduleId.get(zoneId);
+          if (existing !== schedHold.scheduleId) {
+            this.holdScheduleId.set(zoneId, schedHold.scheduleId);
+            this.log(`[Lennox S40] zone=${zoneId} hold scheduleId -> ${schedHold.scheduleId}`);
+          }
+        }
+
+        const acc = this.zoneAccessories.get(zoneId);
+        if (acc && z.status) acc.applyZoneStatus(z.status, z.config);
+      }
+    }
+  }
+
   async startPump() {
+    if (this._pumpRunning) return;
+    this._pumpRunning = true;
     let backoff = 2;
+
     for (;;) {
       try {
-        const msgs = await this.client.retrieve({ count: 60, timeoutSec: this.longPollSeconds });
+        const { messages, nextStartTime } = await this.client.retrieve({
+          startTime: this._retrieveStartTime,
+          count: 60,
+          timeoutSec: this.longPollSeconds,
+        });
         backoff = 2;
 
-        for (const m of msgs) {
-          if (!m || !m.Data) continue;
-          const data = m.Data;
-          if (!Array.isArray(data.zones)) continue;
-
-          for (const z of data.zones) {
-            const zoneId = typeof z.id === "number" ? z.id : undefined;
-            if (zoneId == null) continue;
-
-            const schedHold = z.config && z.config.scheduleHold;
-            if (schedHold && typeof schedHold.scheduleId === "number") {
-              const existing = this.holdScheduleId.get(zoneId);
-              if (existing !== schedHold.scheduleId) {
-                this.holdScheduleId.set(zoneId, schedHold.scheduleId);
-                this.log(`[Lennox S40] zone=${zoneId} hold scheduleId -> ${schedHold.scheduleId}`);
-              }
-            }
-
-            const acc = this.zoneAccessories.get(zoneId);
-            if (acc && z.status) acc.applyZoneStatus(z.status);
+        if (messages.length) {
+          this.applyMessages(messages);
+          if (nextStartTime != null && nextStartTime > this._retrieveStartTime) {
+            this._retrieveStartTime = nextStartTime;
+            this._cursorAdvanced = true;
+          } else if (!this._cursorAdvanced) {
+            this.log.debug("[Lennox S40] Retrieve had no timestamp; cursor stays put so a reconnect can replay current state.");
           }
         }
       } catch (e) {
         this.log.warn(`[Lennox S40] Retrieve error: ${e.message}`);
-        try { await this.client.connect(); } catch {}
-        try { await this.client.connectEndpoint(); } catch {}
+        try {
+          await this.sessionStart(false);
+          this.log("[Lennox S40] Session re-established; RequestData re-issued.");
+        } catch (re) {
+          this.log.warn(`[Lennox S40] Reconnect failed: ${re.message}`);
+        }
         await new Promise((r) => setTimeout(r, backoff * 1000));
         backoff = Math.min(backoff * 2, 60);
       }
