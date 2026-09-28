@@ -2,6 +2,7 @@
 const UUID_NS = "lennox-s40-zone";
 const MIN_DEADBAND_F = 3;
 const MODE_HOLD_MS = 12_000;
+const SETPOINT_GESTURE_MS = 120;
 
 const HK_TO_LENNOX = { 0: "off", 1: "heat", 2: "cool", 3: "heat and cool" };
 const LENNOX_TO_HK = { off: 0, heat: 1, cool: 2, "heat and cool": 3, "emergency heat": 1 };
@@ -117,6 +118,7 @@ class LennoxZoneAccessory {
     this.lastSeenAt = Date.now();
     this.lastHKState = this.Characteristic.CurrentHeatingCoolingState.OFF;
     this._modeHoldUntil = 0;
+    this._spGesture = { heatF: null, coolF: null, lastPinned: null, timer: undefined };
 
     this.service.getCharacteristic(this.Characteristic.StatusActive).onGet(() => this.isActive);
 
@@ -180,7 +182,7 @@ class LennoxZoneAccessory {
       .onGet(() => this.fToC(this.currentHspF ?? 70))
       .onSet(async (cVal) => {
         if (this._mutingHK) return;
-        await this.applyUserSetpoint("heat", this.cToF(cVal));
+        this.queueSetpointGesture("heat", this.cToF(cVal));
       })
       .setProps({ minValue: 4.5, maxValue: 32, minStep: 0.5 });
 
@@ -189,7 +191,7 @@ class LennoxZoneAccessory {
       .onGet(() => this.fToC(this.currentCspF ?? 73))
       .onSet(async (cVal) => {
         if (this._mutingHK) return;
-        await this.applyUserSetpoint("cool", this.cToF(cVal));
+        this.queueSetpointGesture("cool", this.cToF(cVal));
       })
       .setProps({ minValue: 15.5, maxValue: 37, minStep: 0.5 });
 
@@ -210,7 +212,7 @@ class LennoxZoneAccessory {
       this.accessory.getService(this.Service.AccessoryInformation) ||
       this.accessory.addService(this.Service.AccessoryInformation);
 
-    const version = this.platform.pluginVersion || "0.3.0";
+    const version = this.platform.pluginVersion || "0.3.1";
 
     info
       .setCharacteristic(this.Characteristic.Manufacturer, "Lennox")
@@ -223,6 +225,45 @@ class LennoxZoneAccessory {
     this.accessory.context.model = "S40";
     this.accessory.context.serialNumber = String(this.zoneId);
     this.accessory.context.firmwareRevision = version;
+  }
+
+  queueSetpointGesture(pinned, valueF) {
+    const f = Math.round(valueF);
+    if (!Number.isFinite(f)) return;
+    if (pinned === "heat") this._spGesture.heatF = f;
+    if (pinned === "cool") this._spGesture.coolF = f;
+    this._spGesture.lastPinned = pinned;
+    if (this._spGesture.timer) clearTimeout(this._spGesture.timer);
+    this._spGesture.timer = setTimeout(() => {
+      this._spGesture.timer = undefined;
+      this.commitSetpointGesture();
+    }, SETPOINT_GESTURE_MS);
+  }
+
+  commitSetpointGesture() {
+    const g = this._spGesture;
+    const heatF = g.heatF;
+    const coolF = g.coolF;
+    const lastPinned = g.lastPinned;
+    g.heatF = null;
+    g.coolF = null;
+    g.lastPinned = null;
+
+    const heatChanged = heatF != null && heatF !== Math.round(this.currentHspF);
+    const coolChanged = coolF != null && coolF !== Math.round(this.currentCspF);
+
+    let pinned = lastPinned;
+    if (heatChanged && !coolChanged) pinned = "heat";
+    else if (coolChanged && !heatChanged) pinned = "cool";
+    else if (!heatChanged && !coolChanged) return;
+
+    const hsp = heatF != null ? heatF : this.currentHspF ?? 70;
+    const csp = coolF != null ? coolF : this.currentCspF ?? 73;
+    const next = this.applyDeadband(hsp, csp, pinned);
+    this.log(
+      `[${this.displayName}] setpoint gesture pin=${pinned} in hsp=${hsp} csp=${csp} -> hsp=${next.hspF} csp=${next.cspF}`
+    );
+    return this.pushSetpoints(next.hspF, next.cspF);
   }
 
   applyDeadband(hspF, cspF, pinned) {
@@ -238,21 +279,6 @@ class LennoxZoneAccessory {
       hsp = csp - MIN_DEADBAND_F;
     }
     return { hspF: hsp, cspF: csp };
-  }
-
-  async applyUserSetpoint(pinned, valueF) {
-    const next =
-      pinned === "heat"
-        ? this.applyDeadband(valueF, this.currentCspF ?? 73, "heat")
-        : this.applyDeadband(this.currentHspF ?? 70, valueF, "cool");
-
-    if (next.hspF !== Math.round(this.currentHspF) || next.cspF !== Math.round(this.currentCspF)) {
-      this.log(
-        `[${this.displayName}] deadband pin=${pinned} -> hsp=${next.hspF} csp=${next.cspF}`
-      );
-    }
-
-    await this.pushSetpoints(next.hspF, next.cspF);
   }
 
   applyZoneStatus(status, config) {
