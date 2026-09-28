@@ -7,12 +7,7 @@ const axiosLib = require("axios");
 function messageTime(m) {
   if (!m || typeof m !== "object") return null;
   const raw =
-    m.Timestamp ??
-    m.TimeStamp ??
-    m.timestamp ??
-    m.MessageTimestamp ??
-    m.PublishedOn ??
-    m.Time;
+    m.Timestamp ?? m.TimeStamp ?? m.timestamp ?? m.MessageTimestamp ?? m.PublishedOn ?? m.Time;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
@@ -25,14 +20,8 @@ class LccClient {
     this.longPollSeconds = Number(opts.longPollSeconds || 15);
     this.logBodies = !!opts.logBodies;
     this.log = typeof opts.log === "function" ? opts.log : () => {};
-
-    const agent = new https.Agent({
-      rejectUnauthorized: this.verifyTLS,
-      keepAlive: false,
-    });
-
+    const agent = new https.Agent({ rejectUnauthorized: this.verifyTLS, keepAlive: false });
     const timeoutMs = Math.max(20_000, (this.longPollSeconds + 10) * 1000);
-
     this.axios = axiosLib.create({
       baseURL: String(this.host).replace(/\/+$/, ""),
       httpsAgent: agent,
@@ -44,11 +33,16 @@ class LccClient {
     });
   }
 
+  async _publish(body) {
+    const res = await this.axios.post(`/Messages/Publish`, body);
+    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
+    if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
+    return res.data;
+  }
+
   async connect() {
-    this.log(`[client] Connect -> POST /Messages/${encodeURIComponent(this.clientId)}/Connect`);
     try {
-      const url = `/Messages/${encodeURIComponent(this.clientId)}/Connect`;
-      const res = await this.axios.post(url);
+      const res = await this.axios.post(`/Messages/${encodeURIComponent(this.clientId)}/Connect`);
       this.log(`[client] Connect -> ${res.status}`);
     } catch (e) {
       this.log(`[client] Connect soft error: ${e.message}`);
@@ -57,8 +51,7 @@ class LccClient {
 
   async connectEndpoint() {
     try {
-      const url = `/Endpoints/${encodeURIComponent(this.clientId)}/Connect`;
-      const res = await this.axios.post(url);
+      const res = await this.axios.post(`/Endpoints/${encodeURIComponent(this.clientId)}/Connect`);
       this.log(`[client] ConnectEndpoint -> ${res.status}`);
       return res.status;
     } catch (e) {
@@ -76,149 +69,102 @@ class LccClient {
       TargetId: "LCC",
       AdditionalParameters: { JSONPath: jsonPath },
     };
-    this.log(`[client] RequestData -> ${jsonPath}`);
     const res = await this.axios.post(`/Messages/RequestData`, body);
-    this.log(`[client] RequestData -> ${res.status} ${this.logBodies ? JSON.stringify(res.data) : ""}`);
-    return res.data;
-  }
-
-  async setZoneConfigScheduleHold(zoneId, scheduleHoldObj) {
-    const zid = Number(zoneId);
-    const body = {
-      MessageId: Date.now().toString(),
-      MessageType: "Command",
-      SenderId: this.clientId,
-      TargetId: "LCC",
-      data: {
-        zones: [{ id: zid, config: { scheduleHold: scheduleHoldObj } }],
-      },
-      AdditionalParameters: {
-        JSONPath: `zones[id=${zid}]/config/scheduleHold`,
-      },
-    };
-    this.log(`[client] setZoneConfigScheduleHold zid=${zid} body=${JSON.stringify(body.data)}`);
-    const res = await this.axios.post(`/Messages/Publish`, body);
-    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
-    if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
+    this.log(`[client] RequestData -> ${jsonPath} ${res.status}`);
     return res.data;
   }
 
   async retrieve({ startTime = 1, count = 50, timeoutSec = this.longPollSeconds } = {}) {
-    const url = `/Messages/${encodeURIComponent(this.clientId)}/Retrieve`;
-    const params = {
-      Direction: "Oldest-to-Newest",
-      MessageCount: String(count),
-      StartTime: String(startTime),
-      LongPollingTimeout: String(timeoutSec),
-    };
-    const res = await this.axios.get(url, { params });
-
-    if (res.status === 204 || !res.data) {
-      return { messages: [], nextStartTime: startTime };
-    }
-
+    const res = await this.axios.get(`/Messages/${encodeURIComponent(this.clientId)}/Retrieve`, {
+      params: {
+        Direction: "Oldest-to-Newest",
+        MessageCount: String(count),
+        StartTime: String(startTime),
+        LongPollingTimeout: String(timeoutSec),
+      },
+    });
+    if (res.status === 204 || !res.data) return { messages: [], nextStartTime: startTime };
     const raw = res.data.messages || res.data.Messages || [];
     const messages = Array.isArray(raw) ? raw : [];
-
-    if (this.logBodies) {
-      this.log(`[client] Retrieve -> n=${messages.length} ${JSON.stringify(res.data).slice(0, 300)}...`);
-    }
-
     let maxTs = startTime;
     for (const m of messages) {
       const ts = messageTime(m);
       if (ts != null && ts > maxTs) maxTs = ts;
     }
-    const nextStartTime = messages.length && maxTs > startTime ? maxTs + 1 : startTime;
-    return { messages, nextStartTime };
+    return { messages, nextStartTime: messages.length && maxTs > startTime ? maxTs + 1 : startTime };
+  }
+
+  async setZoneConfigScheduleHold(zoneId, scheduleHoldObj) {
+    const zid = Number(zoneId);
+    return this._publish({
+      MessageId: Date.now().toString(),
+      MessageType: "Command",
+      SenderId: this.clientId,
+      TargetId: "LCC",
+      data: { zones: [{ id: zid, config: { scheduleHold: scheduleHoldObj } }] },
+      AdditionalParameters: { JSONPath: `zones[id=${zid}]/config/scheduleHold` },
+    });
   }
 
   async setZoneHoldStatus(zoneId, { type = "temporary", expirationMode = "nextPeriod" } = {}) {
     const zid = Number(zoneId);
-    const body = {
+    return this._publish({
       MessageId: Date.now().toString(),
       MessageType: "PropertyChange",
       SenderId: this.clientId,
       TargetId: "tstat",
-      data: {
-        zones: [{ id: zid, status: { hold: { type, expirationMode } } }],
-      },
-      AdditionalParameters: {
-        JSONPath: `zones[id=${zid}]/status/hold`,
-      },
-    };
-    this.log(`[client] setZoneHoldStatus zid=${zid} body=${JSON.stringify(body.data)}`);
-    const res = await this.axios.post(`/Messages/Publish`, body);
-    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
-    if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
-    return res.data;
+      data: { zones: [{ id: zid, status: { hold: { type, expirationMode } } }] },
+      AdditionalParameters: { JSONPath: `zones[id=${zid}]/status/hold` },
+    });
   }
 
   async setSchedulePeriod(scheduleId, periodId, period) {
-    const safeScheduleId = Number(scheduleId);
-    const safePeriodId = Number(periodId);
-    const body = {
+    const sid = Number(scheduleId);
+    const pid = Number(periodId);
+    return this._publish({
       MessageId: Date.now().toString(),
       MessageType: "Command",
       SenderId: this.clientId,
       TargetId: "LCC",
-      data: {
-        schedules: [
-          {
-            id: safeScheduleId,
-            schedule: {
-              periods: [{ id: safePeriodId, period }],
-            },
-          },
-        ],
-      },
-      AdditionalParameters: {
-        JSONPath: `schedules[id=${safeScheduleId}]/schedule/periods[id=${safePeriodId}]/period`,
-      },
-    };
-    this.log(`[client] setSchedulePeriod sid=${safeScheduleId} pid=${safePeriodId} body=${JSON.stringify(body.data)}`);
-    const res = await this.axios.post(`/Messages/Publish`, body);
-    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
-    if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
-    return res.data;
+      data: { schedules: [{ id: sid, schedule: { periods: [{ id: pid, period }] } }] },
+      AdditionalParameters: { JSONPath: `schedules[id=${sid}]/schedule/periods[id=${pid}]/period` },
+    });
+  }
+
+  // Switch zone onto a schedule (manual = 16+zoneId). Matches lennoxs30api setSchedule.
+  async setZoneSchedule(zoneId, scheduleId) {
+    const zid = Number(zoneId);
+    const sid = Number(scheduleId);
+    return this._publish({
+      MessageId: Date.now().toString(),
+      MessageType: "Command",
+      SenderId: this.clientId,
+      TargetId: "LCC",
+      data: { zones: [{ id: zid, config: { scheduleId: sid } }] },
+      AdditionalParameters: { JSONPath: `zones[id=${zid}]/config/scheduleId` },
+    });
   }
 
   async setScheduleHold(zoneId, scheduleId, { hsp, csp, type = "temporary", expirationMode = "nextPeriod", duration } = {}) {
-    const safeZoneId = Number(zoneId);
-    const safeScheduleId = Number(scheduleId);
-
-    const body = {
+    const zid = Number(zoneId);
+    const sid = Number(scheduleId);
+    const hold = {
+      type,
+      expirationMode,
+      scheduleId: sid,
+      ...(Number.isFinite(duration) ? { duration: Math.round(duration) } : {}),
+      period: {},
+    };
+    if (Number.isFinite(hsp)) hold.period.hsp = Math.round(hsp);
+    if (Number.isFinite(csp)) hold.period.csp = Math.round(csp);
+    return this._publish({
       MessageId: Date.now().toString(),
       MessageType: "Command",
       SenderId: this.clientId,
       TargetId: "LCC",
-      data: {
-        zones: [
-          {
-            id: safeZoneId,
-            command: {
-              setScheduleHold: {
-                type,
-                expirationMode,
-                scheduleId: safeScheduleId,
-                ...(Number.isFinite(duration) ? { duration: Math.round(duration) } : {}),
-                period: {},
-              },
-            },
-          },
-        ],
-      },
+      data: { zones: [{ id: zid, command: { setScheduleHold: hold } }] },
       AdditionalParameters: { JSONPath: "zones/command/setScheduleHold" },
-    };
-
-    if (Number.isFinite(hsp)) body.data.zones[0].command.setScheduleHold.period.hsp = Math.round(hsp);
-    if (Number.isFinite(csp)) body.data.zones[0].command.setScheduleHold.period.csp = Math.round(csp);
-
-    this.log(`[client] setScheduleHold zid=${safeZoneId} sid=${safeScheduleId} body=${JSON.stringify(body.data)}`);
-    const res = await this.axios.post(`/Messages/Publish`, body);
-    this.log(`Publish -> ${res.status} ${this.logBodies && res.data ? JSON.stringify(res.data) : ""}`);
-    if (res.status < 200 || res.status >= 300) throw new Error(`Publish failed: ${res.status}`);
-    return res.data;
+    });
   }
 }
 
